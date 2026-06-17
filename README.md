@@ -33,6 +33,18 @@ muhkoo deploy
 `provision` writes `.muhkoo-app.json` (app id + keys). `deploy` reads it, so once an
 app is provisioned both commands run with no extra flags.
 
+## Sign in
+
+```bash
+muhkoo login --web      # opens auth.muhkoo.dev in your browser (recommended)
+muhkoo login            # zero-knowledge login from the terminal (prompts)
+```
+
+`--web` opens the hosted sign-in page, you authenticate however you like (password,
+passkey, or Google), and the CLI captures the session over a one-time `localhost`
+redirect — your credentials never touch the CLI. The terminal flow runs the
+zero-knowledge login locally; your password still never leaves your machine.
+
 ## Authentication
 
 Most commands use your **developer session**, established by `muhkoo login` and stored

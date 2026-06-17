@@ -6,17 +6,22 @@
 
 import { resolveBase, loadConfig, saveConfig } from "../lib/config.js";
 import { zkLogin } from "../lib/auth.js";
+import { webLogin, DEFAULT_CLI_APP_ID } from "../lib/webLogin.js";
 import { devCall } from "../lib/http.js";
+import { firstOf } from "../lib/args.js";
 import { prompt, promptHidden, ok, step, info, die, c } from "../lib/ui.js";
 
 export const help = `muhkoo login — sign in as a developer
 
 Usage:
+  muhkoo login --web [--base <env|url>]                 sign in via the browser
   muhkoo login [--username <u>] [--password <p>] [--base <env|url>]
   muhkoo login --token <sessionToken> [--base <env|url>]
 
-Credentials are read from flags, then $MUHKOO_USERNAME/$MUHKOO_PASSWORD, then
-an interactive prompt. The resulting session token is saved to ~/.muhkoo/config.json.`;
+--web opens auth.muhkoo.dev in your browser (password, passkey, or Google) and
+captures the session over a localhost redirect — no credentials touch the CLI.
+Otherwise credentials are read from flags, then $MUHKOO_USERNAME/$MUHKOO_PASSWORD,
+then a prompt. The session token is saved to ~/.muhkoo/config.json.`;
 
 export default async function login(args) {
   const cfg = await loadConfig();
@@ -26,7 +31,13 @@ export default async function login(args) {
   let username = args.username || process.env.MUHKOO_USERNAME;
   let commitment;
 
-  if (!token) {
+  if (!token && (args.web || args.browser)) {
+    const appId = firstOf(args["app-id"], process.env.MUHKOO_CLI_APP_ID, cfg.cliAppId, DEFAULT_CLI_APP_ID);
+    const res = await webLogin({ baseUrl, appId });
+    token = res.token;
+    commitment = res.commitment;
+    username = res.username;
+  } else if (!token) {
     if (!username) username = await prompt("Username: ");
     let password = args.password || process.env.MUHKOO_PASSWORD;
     if (!password) password = await promptHidden("Password: ");

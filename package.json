@@ -1,6 +1,6 @@
 {
   "name": "@muhkoo/cli",
-  "version": "0.1.0-alpha.0",
+  "version": "0.7.0-alpha.4",
   "description": "Command-line interface for the Muhkoo platform — provision backends, deploy apps, and manage agents, functions, databases, and domains.",
   "type": "module",
   "license": "MIT",
@@ -33,10 +33,12 @@
   },
   "scripts": {
     "muhkoo": "node bin/muhkoo.js",
-    "lint": "node --check bin/muhkoo.js"
+    "lint": "node --check bin/muhkoo.js",
+    "sync-version": "node scripts/sync-version.mjs",
+    "prepublishOnly": "node scripts/sync-version.mjs --check"
   },
   "dependencies": {
-    "@muhkoo/connect": "file:../connect"
+    "@muhkoo/connect": "0.7.0-alpha.4"
   },
   "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
 }

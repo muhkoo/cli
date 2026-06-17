@@ -9,7 +9,9 @@ First public alpha of the `muhkoo` CLI. Built on `@muhkoo/connect`.
 ### Added
 
 - **Account:** `login` (zero-knowledge developer login → stored session token),
-  `logout`, `whoami`. Token also resolvable via `--token` / `$MUHKOO_DEV_TOKEN`.
+  `login --web` (browser sign-in via auth.muhkoo.dev over a localhost loopback —
+  password/passkey/Google, no credentials touch the CLI), `logout`, `whoami`.
+  Token also resolvable via `--token` / `$MUHKOO_DEV_TOKEN`.
 - **Apps:** `apps ls|get|create|slug|rm`, `keys rotate`.
 - **Backend provisioning:** `provision --spec <file>` — idempotently create/update
   database tables, agents, and serverless functions from one JSON spec; `--enable`
