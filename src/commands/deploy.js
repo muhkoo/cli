@@ -14,7 +14,7 @@ import { join, relative, sep } from "node:path";
 import { resolveBase, loadConfig, resolveToken } from "../lib/config.js";
 import { skCall, ensure } from "../lib/http.js";
 import { firstOf } from "../lib/args.js";
-import { step, ok, info, die } from "../lib/ui.js";
+import { step, ok, info, die, redact } from "../lib/ui.js";
 
 export const help = `muhkoo deploy — deploy a built client to Muhkoo hosting
 
@@ -81,7 +81,7 @@ export default async function deploy(args) {
   let deduped = 0;
   for (const [sha, bytes] of blobs) {
     const r = await skCall(baseUrl, auth, "PUT", `/api/apps/${appId}/hosting/blob/${sha}`, bytes, { raw: true });
-    if (!r.ok) die(`Upload failed for ${sha} (${r.status}): ${await r.res.text()}`);
+    if (!r.ok) die(`Upload failed for ${sha} (${r.status}): ${redact(await r.res.text())}`);
     const body = await r.res.json().catch(() => ({}));
     if (body.dedup) deduped++;
     else uploaded++;

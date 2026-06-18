@@ -6,7 +6,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename, chmod } from "node:fs/promises";
 import { resolveBaseUrl } from "./bases.js";
 import { firstOf } from "./args.js";
 import { die } from "./ui.js";
@@ -27,10 +27,15 @@ export async function loadConfig() {
 }
 
 export async function saveConfig(next) {
-  await mkdir(configDir(), { recursive: true });
-  await writeFile(configPath(), JSON.stringify(next, null, 2) + "\n");
-  // Contains a session token — keep it owner-only.
-  await chmod(configPath(), 0o600).catch(() => {});
+  // The config holds a session token, so it must never be world-readable —
+  // not even briefly. Create the dir owner-only, write to a temp file with
+  // mode 0o600, then atomically rename it into place (the renamed file keeps
+  // its restrictive perms, with no truncation/permission window).
+  await mkdir(configDir(), { recursive: true, mode: 0o700 });
+  await chmod(configDir(), 0o700).catch(() => {}); // tighten an existing dir
+  const tmp = join(configDir(), `.config.${process.pid}.tmp`);
+  await writeFile(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+  await rename(tmp, configPath());
 }
 
 /**

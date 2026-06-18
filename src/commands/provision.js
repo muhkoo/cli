@@ -15,7 +15,7 @@
  *   }
  */
 
-import { readFile, writeFile, access } from "node:fs/promises";
+import { readFile, writeFile, access, chmod } from "node:fs/promises";
 import { devContext } from "../lib/config.js";
 import { devCall, appKeyGet } from "../lib/http.js";
 import { appsSuffixFor } from "../lib/bases.js";
@@ -33,7 +33,9 @@ async function readJson(path) {
   return JSON.parse(await readFile(path, "utf8"));
 }
 async function writeJson(path, obj) {
-  await writeFile(path, JSON.stringify(obj, null, 2) + "\n");
+  // .muhkoo-app.json carries the app's secret (sk) keys — keep it owner-only.
+  await writeFile(path, JSON.stringify(obj, null, 2) + "\n", { mode: 0o600 });
+  await chmod(path, 0o600).catch(() => {}); // tighten if the file already existed
 }
 async function fileExists(path) {
   try {

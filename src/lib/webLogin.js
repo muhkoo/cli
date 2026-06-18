@@ -21,7 +21,7 @@ import http from "node:http";
 import { generatePkce, randomState } from "./pkce.js";
 import { openBrowser } from "./browser.js";
 import { authBaseFor } from "./bases.js";
-import { step, info, die, c } from "./ui.js";
+import { step, info, die, redact, c } from "./ui.js";
 
 /** The CLI's first-party client id. Override with --app-id / $MUHKOO_CLI_APP_ID. */
 export const DEFAULT_CLI_APP_ID = "muhkoo-cli";
@@ -29,10 +29,16 @@ export const DEFAULT_CLI_APP_ID = "muhkoo-cli";
 /** Loopback ports tried in order — each must be registered in FIRST_PARTY_REDIRECT_URIS. */
 const PORTS = [8976, 8977, 8978];
 
+/** HTML-escape untrusted text before interpolating it into the loopback page. */
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
 function successPage(message, isError) {
   const color = isError ? "#c0392b" : "#0a1929";
   const title = isError ? "Sign-in failed" : "Signed in to the Muhkoo CLI";
-  const body = isError ? message : "You can close this tab and return to your terminal.";
+  const body = isError ? escapeHtml(message) : "You can close this tab and return to your terminal.";
   return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
 <style>body{font-family:Inter,system-ui,sans-serif;background:#f6f8fa;color:${color};
 display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
@@ -133,7 +139,7 @@ export async function webLogin({ baseUrl, appId }) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ code, codeVerifier: verifier, appId }),
   });
-  if (!res.ok) die(`Token exchange failed (${res.status}): ${await res.text()}`);
+  if (!res.ok) die(`Token exchange failed (${res.status}): ${redact(await res.text())}`);
   const body = await res.json().catch(() => null);
   if (!body?.sessionToken) die("No session token returned from the token exchange.");
   return { token: body.sessionToken, username: body.username, commitment: body.commitment };

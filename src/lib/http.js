@@ -4,7 +4,7 @@
  * → "needs a paid plan") without re-parsing.
  */
 
-import { die } from "./ui.js";
+import { die, redact } from "./ui.js";
 
 async function request(baseUrl, method, path, { auth, body, raw } = {}) {
   const headers = {};
@@ -49,11 +49,12 @@ export async function appKeyGet(baseUrl, appKey, path) {
 /** Exit with a formatted message when a `{ ok, status, body }` result failed. */
 export function ensure(result, what) {
   if (result.ok) return result;
-  const detail =
+  const detail = redact(
     typeof result.body === "string"
       ? result.body
       : result.body
         ? JSON.stringify(result.body)
-        : "";
+        : "",
+  );
   die(`${what} failed (${result.status})${detail ? `: ${detail}` : ""}`);
 }

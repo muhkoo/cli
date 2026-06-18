@@ -2,6 +2,16 @@
 
 All notable changes to `@muhkoo/cli` are documented here.
 
+## 0.7.0-alpha.5 — Security hardening (2026-06-18)
+
+### Security
+
+- Write `~/.muhkoo/config.json` (session token) and `.muhkoo-app.json` (app secret keys) with `0600` permissions — config via temp-file + atomic rename, directory `0700` — so there's no world-readable window.
+- HTML-escape the loopback sign-in page, and redact app keys / long tokens from echoed server error bodies (login, deploy, and generic request errors).
+- Added `SECURITY.md`.
+
+> Versioned in lockstep with `@muhkoo/connect`; the jump to `0.7.0-alpha.5` keeps the two aligned.
+
 ## 0.1.0-alpha.0 — Initial release
 
 First public alpha of the `muhkoo` CLI. Built on `@muhkoo/connect`.

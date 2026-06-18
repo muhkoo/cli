@@ -41,6 +41,17 @@ export function json(obj) {
   console.log(JSON.stringify(obj, null, 2));
 }
 
+/**
+ * Mask secret-shaped substrings (app keys, long bearer-style tokens) in
+ * untrusted text — e.g. a server error body — before printing it, so a
+ * reflected key/token can't leak into the terminal or CI logs.
+ */
+export function redact(s) {
+  return String(s)
+    .replace(/mk_[a-z0-9]+_[a-z0-9]+_[A-Za-z0-9]+/gi, (m) => m.slice(0, 11) + "…")
+    .replace(/\b[A-Za-z0-9._-]{40,}\b/g, (m) => m.slice(0, 6) + "…[redacted]");
+}
+
 /** Render a simple aligned table from rows of strings. */
 export function table(headers, rows) {
   const widths = headers.map((h, i) =>
