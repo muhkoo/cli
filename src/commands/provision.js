@@ -64,6 +64,7 @@ export default async function provision(args) {
 
   await ensureDeveloper(ctx, spec.email, DRY);
   const app = await createOrReuseApp(ctx, spec, prior, DRY);
+  await applyHostingConfig(ctx, app.appId, spec, prior, DRY);
   const tables = await putTables(ctx, app.appId, spec.tables, DRY);
   const agents = await createAgents(ctx, app.appId, spec.agents, DRY);
   const functions = await deployFunctions(ctx, app.appId, spec.functions, DRY);
@@ -116,6 +117,11 @@ async function createOrReuseApp(ctx, spec, prior, DRY) {
   if (DRY) return { appId: "<dry-run>", slug: spec.slug, keys: [] };
   const body = { slug: spec.slug, allowedOrigins: spec.allowedOrigins || "*" };
   if (spec.email) body.email = spec.email;
+  // Cross-origin isolation (COOP+COEP → SharedArrayBuffer → multi-threaded wasm)
+  // is an opt-in per-app hosting setting. Accept it at the top level or under
+  // `hosting`. Also re-applied to existing apps below (see applyHostingConfig).
+  const coi = spec.crossOriginIsolation ?? spec.hosting?.crossOriginIsolation;
+  if (coi !== undefined) body.crossOriginIsolation = coi === true;
   let r = await devCall(ctx, "POST", "/api/apps", body);
   if (!r.ok && r.status === 402 && spec.email) {
     await ensureDeveloper(ctx, spec.email, DRY);
@@ -126,6 +132,17 @@ async function createOrReuseApp(ctx, spec, prior, DRY) {
   const pk = keys.find((k) => k.env === "test" && k.type === "pk")?.plaintext;
   info(`  ${c.green("✓")} appId ${r.body.appId}` + (pk ? `   test pk ${pk.slice(0, 18)}…` : ""));
   return { appId: r.body.appId, slug: r.body.slug, keys };
+}
+
+/** Apply per-app hosting settings that aren't part of app creation. Idempotent;
+ *  runs for both new and reused apps (create only sets it on first creation). */
+async function applyHostingConfig(ctx, appId, spec, prior, DRY) {
+  const coi = spec.crossOriginIsolation ?? spec.hosting?.crossOriginIsolation;
+  if (coi === undefined || !prior?.appId) return; // new app already set it at create
+  step(`Hosting: cross-origin isolation ${coi ? "on" : "off"}…`);
+  if (DRY) return;
+  const r = await devCall(ctx, "PATCH", `/api/apps/${appId}`, { crossOriginIsolation: coi === true });
+  if (!r.ok) info(`  ${c.yellow ? c.yellow("!") : "!"} could not set cross-origin isolation (${r.status})`);
 }
 
 async function putTables(ctx, appId, tables, DRY) {
