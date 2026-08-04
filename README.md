@@ -26,12 +26,15 @@ muhkoo login
 muhkoo apps create --slug my-app --email you@example.com
 muhkoo provision --spec app.json
 
-# 3. Build your client, then deploy it
+# 3. Build your client, deploy to the test env, then promote to production
 muhkoo deploy
+muhkoo promote
 ```
 
 `provision` writes `.muhkoo-app.json` (app id + keys). `deploy` reads it, so once an
-app is provisioned both commands run with no extra flags.
+app is provisioned every command runs with no extra flags. `deploy` publishes to the
+app's **test** environment; once it looks right on the test URL, `promote` copies that
+release onto **production**, in place.
 
 ## Sign in
 
@@ -77,7 +80,7 @@ muhkoo whoami  --base https://api.example.com
 Account     login · logout · whoami
 Apps        apps ls|get|create|slug|rm · keys rotate
 Backend     provision · tables · agents · functions
-Hosting     deploy · hosting status|rollback|rm-release|unpublish · domains
+Hosting     deploy · promote · hosting status|rollback|rm-release|unpublish · domains
 Tools       logs · eject
 ```
 
@@ -87,6 +90,8 @@ Run `muhkoo <command> --help` for details. A few highlights:
 muhkoo apps ls                                  # list your apps
 muhkoo provision --spec app.json --dry-run      # preview API calls
 muhkoo provision --spec app.json --enable       # enable agents/functions on channels
+muhkoo deploy                                   # publish dist/ to the test env
+muhkoo promote                                  # promote test → production, in place
 muhkoo hosting status <appId>                   # releases + current pointer
 muhkoo hosting rollback <appId> --release <id>  # instant rollback
 muhkoo domains add <appId> app.example.com      # attach a custom domain

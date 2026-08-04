@@ -16,8 +16,10 @@ const COMMANDS = {
   whoami: () => import("./commands/whoami.js"),
   apps: () => import("./commands/apps.js"),
   keys: () => import("./commands/apps.js"), // `keys rotate` lives in apps.js
+  tokens: () => import("./commands/tokens.js"),
   provision: () => import("./commands/provision.js"),
   deploy: () => import("./commands/deploy.js"),
+  promote: () => import("./commands/promote.js"),
   hosting: () => import("./commands/hosting.js"),
   domains: () => import("./commands/domains.js"),
   tables: () => import("./commands/tables.js"),
@@ -40,6 +42,7 @@ Account
 Apps
   apps ls|get|create|slug|rm     manage apps
   keys rotate <appId>            rotate an app's keys
+  tokens ls|create|revoke        manage scoped access tokens
 
 Backend
   provision --spec <f>   create/update tables, agents, functions from a spec
@@ -48,7 +51,8 @@ Backend
   functions ls|get|code|deploy|rm|enable|disable
 
 Hosting
-  deploy                 deploy a built client to Muhkoo hosting
+  deploy                 deploy a built client to Muhkoo hosting (test env)
+  promote                promote an app's test hosting → production
   hosting status|rollback|rm-release|unpublish
   domains ls|add|rm      manage custom domains
 

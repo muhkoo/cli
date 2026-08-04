@@ -2,6 +2,26 @@
 
 All notable changes to `@muhkoo/cli` are documented here.
 
+## 0.10.11-alpha.0 — Access tokens + `muhkoo login` fix (2026-07-29)
+
+### Fixed
+
+- **`muhkoo login` no longer fails with `ERR_MODULE_NOT_FOUND: snarkjs`.** The ZK login path needs `snarkjs` at runtime, but it was never declared as a dependency — so a clean `npm i -g @muhkoo/cli` couldn't sign in (the workaround was installing `snarkjs` globally by hand). It's now a direct dependency.
+
+### Added
+
+- `muhkoo tokens ls|create|revoke <appId>` — manage **[access tokens](https://docs.muhkoo.dev/concepts/access-tokens/)**, the scoped, expiring credential a machine (CI, a server, a function) presents instead of a ZK sign-in. `create` takes `--scopes` (comma-separated, default `db:read,db:write`), `--env`, `--expires-in <days>`, and `--label`; the secret is printed once. `ls` shows label, env, scopes, expiry, and status.
+
+> Versioned in lockstep with `@muhkoo/connect@0.10.11-alpha.0`.
+
+## 0.10.9-alpha.0 — `promote` command (2026-07-06)
+
+### Added
+
+- `muhkoo promote [<appId>]` — promote an app's **test** hosting release (and functions) to **production**, in place. Complements `muhkoo deploy` (which publishes to the test env): deploy → verify on the test URL → `promote`. Owner-only (uses your developer session); the app id falls back to `.muhkoo-app.json`. Production data and per-env app config (CORS + redirect URIs) are not touched. `--json` for machine-readable output; a partial promote exits non-zero.
+
+> Versioned in lockstep with `@muhkoo/connect@0.10.9-alpha.0` (passkey platform-authenticator fix).
+
 ## 0.7.0-alpha.5 — Security hardening (2026-06-18)
 
 ### Security
