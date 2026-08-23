@@ -33,6 +33,7 @@ Usage:
   muhkoo vfs history <path>              prior versions, newest first
   muhkoo vfs restore <path> [index]      restore a version (default 0)
   muhkoo vfs mount <dir> [--path <p>]    sync a subtree to disk and keep it live
+                                        (dot-files skipped; deletes need --allow-delete)
   muhkoo vfs sweep [--force]             reclaim orphaned records
   muhkoo vfs use-app <domain>            use an app, by the domain you use it at
   muhkoo vfs app                         show which app you are writing as
@@ -44,6 +45,9 @@ Options:
   --app <name>   write as this app for one command
   --key <k>      supply the app key yourself (apps that publish their public
                  config at /.well-known/muhkoo.json need no key)
+  --allow-delete propagate local deletions. OFF by default: a delete removes
+                 the file's history too, so unlike an overwrite it cannot be undone
+  --hidden       also sync dot-files and dot-directories
   --no-pair      unlock for this command only; pair nothing to this machine`;
 
 export default async function vfs(args) {
@@ -210,7 +214,10 @@ export default async function vfs(args) {
       const stop = () => controller.abort();
       process.on("SIGINT", stop);
       process.on("SIGTERM", stop);
-      await mountDir({ client, dir: resolve(dir), root, signal: controller.signal });
+      await mountDir({
+        client, dir: resolve(dir), root, signal: controller.signal,
+        opts: { allowDelete: Boolean(args["allow-delete"]), hidden: Boolean(args.hidden) },
+      });
       return ok("Unmounted.");
     }
 

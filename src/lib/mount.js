@@ -30,7 +30,21 @@ import { planSync } from "./syncPlan.js";
 import { info, ok, warn } from "./ui.js";
 
 /** Never sync these. Build output and dependencies belong to the machine. */
-const IGNORE = new Set([".git", "node_modules", ".muhkoo", ".DS_Store", "dist", ".cache", ".next"]);
+const IGNORE = new Set(["node_modules", "dist", "build", "coverage", "target", "vendor"]);
+
+/**
+ * Skip dot-entries by default.
+ *
+ * The first version listed known-bad names and synced everything else, which is
+ * backwards: the set of tool directories a machine accumulates is open-ended and
+ * grows without asking. It uploaded a session-tooling directory (`.remember`) to
+ * a user's project on first contact with a real repo — a name no deny-list would
+ * have contained, because it did not exist when the list was written.
+ *
+ * Dot-entries are machine state until proven otherwise. `--hidden` opts back in
+ * for a project that genuinely keeps source there.
+ */
+const isHidden = (name) => name.startsWith(".");
 
 /**
  * Skip anything enormous.
@@ -62,7 +76,7 @@ async function saveState(dir, state) {
 }
 
 /** Hash every syncable file under `dir`, keyed by VFS-style relative path. */
-async function scanLocal(dir) {
+async function scanLocal(dir, includeHidden = false) {
     const out = {};
     const walk = async (abs) => {
         let entries;
@@ -73,6 +87,7 @@ async function scanLocal(dir) {
         }
         for (const entry of entries) {
             if (IGNORE.has(entry.name)) continue;
+            if (!includeHidden && isHidden(entry.name)) continue;
             const child = join(abs, entry.name);
             if (entry.isDirectory()) {
                 await walk(child);
@@ -112,8 +127,8 @@ async function scanRemote(vfs, root) {
  * record each, and two concurrent writes to the same record would have one
  * silently lose ([[VfsNamespace]] consistency note).
  */
-async function reconcile({ vfs, dir, root, state }) {
-    const [local, remote] = await Promise.all([scanLocal(dir), scanRemote(vfs, root)]);
+async function reconcile({ vfs, dir, root, state, opts = {} }) {
+    const [local, remote] = await Promise.all([scanLocal(dir, opts.hidden), scanRemote(vfs, root)]);
     const plan = planSync({ last: state, local, remote });
     if (!plan.length) return state;
 
@@ -139,6 +154,23 @@ async function reconcile({ vfs, dir, root, state }) {
                     break;
                 }
                 case "delete-remote":
+                    // Deletes do NOT propagate unless asked for.
+                    //
+                    // Everything else this tool does is recoverable: an
+                    // overwrite leaves the old version in `vfs history`. A
+                    // delete is not — removing a file drops its history record
+                    // along with it, so the safety net that justifies
+                    // last-writer-wins does not cover this case. Losing a file
+                    // to a directory you happened to clean up locally is too
+                    // high a price for the convenience.
+                    if (!opts.allowDelete) {
+                        warn(
+                            `${path} is gone locally but still in your filesystem — not deleting it.\n` +
+                            `  Pass --allow-delete to propagate deletions, or remove it with: muhkoo vfs rm ${remoteAbs}`,
+                        );
+                        delete next[path];   // stop re-reporting it every pass
+                        break;
+                    }
                     await vfs.delete(remoteAbs).catch(() => {});
                     delete next[path];
                     info(`✕ ${path} (removed here)`);
@@ -177,13 +209,13 @@ async function reconcile({ vfs, dir, root, state }) {
 /**
  * Mount `root` at `dir` and keep them in step until `signal` aborts.
  */
-export async function mount({ client, dir, root, signal }) {
+export async function mount({ client, dir, root, signal, opts = {} }) {
     const vfs = client.vfs;
     await mkdir(dir, { recursive: true });
 
     let state = await loadState(dir);
     info(`Mounting ${root} → ${dir}`);
-    state = await reconcile({ vfs, dir, root, state });
+    state = await reconcile({ vfs, dir, root, state, opts });
     ok("In sync. Watching for changes — press Ctrl-C to stop.");
 
     // One reconcile at a time, with a trailing pass if anything arrived while we
@@ -199,7 +231,7 @@ export async function mount({ client, dir, root, signal }) {
         }
         running = true;
         try {
-            state = await reconcile({ vfs, dir, root, state });
+            state = await reconcile({ vfs, dir, root, state, opts });
         } catch (err) {
             warn(`sync failed: ${err?.message ?? err}`);
         } finally {
