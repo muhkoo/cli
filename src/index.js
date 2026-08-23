@@ -20,6 +20,8 @@ const COMMANDS = {
   provision: () => import("./commands/provision.js"),
   deploy: () => import("./commands/deploy.js"),
   promote: () => import("./commands/promote.js"),
+  vfs: () => import("./commands/vfs.js"),
+  devices: () => import("./commands/devices.js"),
   hosting: () => import("./commands/hosting.js"),
   domains: () => import("./commands/domains.js"),
   tables: () => import("./commands/tables.js"),
@@ -37,6 +39,7 @@ Usage:
 Account
   login                  sign in as a developer (stores a session token)
   logout                 clear the stored session
+  devices ls|rm          machines paired to your account
   whoami                 show the signed-in developer
 
 Apps
@@ -49,6 +52,10 @@ Backend
   tables ls|get|rm       inspect database tables
   agents ls|get|rm|enable|disable|models
   functions ls|get|code|deploy|rm|enable|disable
+
+Files
+  vfs ls|cat|put|get|rm|cp|mv|find|history|restore
+                         your encrypted filesystem
 
 Hosting
   deploy                 deploy a built client to Muhkoo hosting (test env)

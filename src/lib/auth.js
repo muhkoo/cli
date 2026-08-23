@@ -14,7 +14,7 @@ import { die, step } from "./ui.js";
  * Download the ZK login circuit assets (wasm + zkey) to a temp dir and return
  * local file paths — in Node the prover reads them off disk, not over HTTP.
  */
-async function downloadCircuits(baseUrl) {
+export async function downloadCircuits(baseUrl) {
   const dir = await mkdtemp(join(tmpdir(), "muhkoo-circuits-"));
   const fetchTo = async (path, file) => {
     const res = await fetch(baseUrl + path);
@@ -31,7 +31,7 @@ async function downloadCircuits(baseUrl) {
 }
 
 /** Resolve `@muhkoo/connect`'s `Client` from the CLI's own dependencies. */
-async function loadClient() {
+export async function loadClient() {
   try {
     const mod = await import("@muhkoo/connect");
     if (!mod.Client) throw new Error("Client export missing");
