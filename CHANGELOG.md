@@ -2,6 +2,20 @@
 
 All notable changes to `@muhkoo/cli` are documented here.
 
+## 0.13.0-alpha.0 — the sync no longer trusts what comes down (2026-08-24)
+
+### Security
+
+`vfs mount` writes the remote filesystem onto local disk, so anything able to write a user's VFS could choose both the bytes and the path of a file landing on their machine. Today that includes **every app the user signs into**, because hosted auth hands the app the master seed (tracked as SEC-3 in `accelerator/SECURITY-FOLLOWUPS.md`).
+
+- **The ignore rules apply in both directions.** They previously decided only what LEFT the machine — nothing filtered what arrived, so a remote `/.git/config` was written straight into the developer's repository. `core.pager`, `alias.*` and `core.fsmonitor` are shell commands git runs itself on an ordinary `git status`, and need no execute bit, which the 0644 the sync writes would otherwise have denied.
+- **An always-refused list that no flag overrides**: `.git/`, `.ssh/`, `.muhkoo/`, `.vscode/`, `.idea/`, `node_modules/`, `.envrc`, `.npmrc`, `.netrc` and shell rc files. `--hidden` means "sync dot-files", not "let a remote party rewrite my git config".
+- **Writes and deletes refuse anything that is not a regular file.** `writeFile` opens with `O_CREAT|O_TRUNC` and follows symlinks, so a link anywhere in the mounted tree redirected remote content to whatever it pointed at — the one way content genuinely escaped the mount directory, on every platform. `scanLocal` already refused to *read* non-regular files; the two directions now agree.
+- **A containment check** so a synced path cannot resolve outside the mount, applied to every action. Traversal was not reachable through the normal remote path (the SDK collapses `..` before a path leaves `walk()`), but nothing here relied on that, and the state file is a second source of keys that never passes through it.
+- **`delete-local` is gated behind `--allow-delete`**, like the remote direction. Anything able to delete a file from the filesystem previously deleted it from the developer's disk with no flag and no prompt.
+
+Covered by the new `tests/mount.test.js` — 11 of its cases fail against the previous release.
+
 ## 0.12.0-alpha.0 — `muhkoo vcs`, bulk import, and `.vcsignore` (2026-08-24)
 
 ### Added

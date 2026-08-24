@@ -22,9 +22,9 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { watch } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { planSync } from "./syncPlan.js";
 import { loadIgnores } from "./ignore.js";
@@ -138,14 +138,91 @@ async function scanLocal(dir, includeHidden = false, ignore = () => false) {
     return out;
 }
 
-/** Hash every file under the mounted VFS subtree. */
-async function scanRemote(vfs, root) {
+/**
+ * Hash every file under the mounted VFS subtree — through the SAME filters as
+ * the local scan.
+ *
+ * These filters used to run in one direction only. They decided what left the
+ * machine and nothing decided what arrived, so a remote `.git/config` was
+ * hashed here, found no local counterpart, and was written straight into the
+ * developer's repository. `core.pager`, `alias.*` and `core.fsmonitor` are
+ * shell commands git runs itself, so that is remote code execution on the next
+ * ordinary `git status` — no execute bit required.
+ *
+ * Anything that can write to a user's VFS is therefore a party that can write
+ * files onto the machines they mount from. Treat what comes down as untrusted.
+ */
+export async function scanRemote(vfs, root, includeHidden = false, ignore = () => false) {
     const out = {};
     if (!(await vfs.exists(root))) return out;
     for (const abs of await vfs.walk(root)) {
-        out[abs.slice(root.length) || "/" + abs.split("/").pop()] = sha(await vfs.readFile(abs));
+        const key = abs.slice(root.length) || "/" + abs.split("/").pop();
+        const rel = key.replace(/^\//, "");
+        if (!rel) continue;
+        if (isRefused(rel)) {
+            warn(`refusing ${key} from your filesystem — that path can execute code on this machine`);
+            continue;
+        }
+        if (ignore(rel, false)) continue;
+        // Same dot-entry rule as `scanLocal`, applied to every segment: a remote
+        // `.vscode/tasks.json` is as dangerous as a remote `.vscode`.
+        if (!includeHidden && rel.split("/").some((part) => isHidden(part) && !KEEP_HIDDEN.has(part))) continue;
+        out[key] = sha(await vfs.readFile(abs));
     }
     return out;
+}
+
+/**
+ * Paths no flag may bring down, ever.
+ *
+ * `--hidden` means "sync dot-files", not "let whatever can write my filesystem
+ * rewrite my git config". Each of these reaches code execution without needing
+ * an execute bit, which is what the 0644 the writer creates would otherwise
+ * deny. Matched on the first segment, or the whole path for the bare files.
+ */
+const REFUSED_DIRS = new Set([".git", ".ssh", ".muhkoo", ".vscode", ".idea", ".config", "node_modules"]);
+const REFUSED_FILES = new Set([".envrc", ".npmrc", ".netrc", ".profile", ".bashrc", ".zshrc", ".bash_profile"]);
+
+// Exported for tests: these three ARE the security boundary, so they are worth
+// asserting on directly rather than only through a full sync.
+export function isRefused(rel) {
+    const parts = rel.split("/");
+    if (parts.some((part) => REFUSED_DIRS.has(part))) return true;
+    return parts.some((part) => REFUSED_FILES.has(part));
+}
+
+/**
+ * The local path for a synced path, or null when it escapes the mount.
+ *
+ * The SDK's `normalizePath` collapses `..` before a path ever leaves `walk()`,
+ * so traversal is not reachable that way today — but nothing here depended on
+ * that, the guarantee lives in another package, and the state file supplies a
+ * second source of keys that never passes through it. This makes the property
+ * local and checkable.
+ */
+export function localPathFor(dir, path) {
+    const candidate = resolve(join(dir, path.replace(/^\//, "").split("/").join(sep)));
+    const rel = relative(dir, candidate);
+    if (!rel || rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) return null;
+    return candidate;
+}
+
+/**
+ * Is it safe to write here?
+ *
+ * `writeFile` opens with O_CREAT|O_TRUNC and FOLLOWS symlinks, so a link
+ * anywhere in the mounted tree redirects remote content to whatever it points
+ * at — the one way content genuinely escapes the mount directory, and it works
+ * on every platform. `scanLocal` already refuses to READ anything that is not a
+ * regular file (`entry.isFile()`); this makes the write side agree.
+ */
+async function writable(localAbs) {
+    try {
+        const info = await lstat(localAbs);
+        return info.isFile();
+    } catch {
+        return true;   // does not exist yet: creating it is fine
+    }
 }
 
 /**
@@ -155,20 +232,27 @@ async function scanRemote(vfs, root) {
  * record each, and two concurrent writes to the same record would have one
  * silently lose ([[VfsNamespace]] consistency note).
  */
-async function reconcile({ vfs, dir, root, state, opts = {} }) {
+export async function reconcile({ vfs, dir, root, state, opts = {} }) {
     // Re-read every pass: editing `.vcsignore` should take effect on the next
     // sync, not require a restart.
     const { match } = await loadIgnores(dir, readFile);
     const [local, remote] = await Promise.all([
         scanLocal(dir, opts.hidden, match),
-        scanRemote(vfs, root),
+        scanRemote(vfs, root, opts.hidden, match),
     ]);
     const plan = planSync({ last: state, local, remote });
     if (!plan.length) return state;
 
     const next = { ...state };
     for (const { path, action } of plan) {
-        const localAbs = join(dir, path.slice(1).split("/").join(sep));
+        const localAbs = localPathFor(dir, path);
+        if (!localAbs) {
+            // Warn and skip rather than throw: one bad path must not abandon
+            // the rest of the sync.
+            warn(`refusing ${path} — it resolves outside ${dir}`);
+            delete next[path];
+            continue;
+        }
         const remoteAbs = root + path;
         try {
             switch (action) {
@@ -180,6 +264,10 @@ async function reconcile({ vfs, dir, root, state, opts = {} }) {
                     break;
                 }
                 case "pull": {
+                    if (!(await writable(localAbs))) {
+                        warn(`skipping ${path} — ${localAbs} is a symlink or not a regular file`);
+                        break;
+                    }
                     const bytes = await vfs.readFile(remoteAbs);
                     await mkdir(dirname(localAbs), { recursive: true });
                     await writeFile(localAbs, bytes);
@@ -210,6 +298,23 @@ async function reconcile({ vfs, dir, root, state, opts = {} }) {
                     info(`✕ ${path} (removed here)`);
                     break;
                 case "delete-local":
+                    // Gated like the remote direction. `--allow-delete` used to
+                    // cover only deletions going UP, so anything able to remove
+                    // a file from the filesystem removed it from the
+                    // developer's disk with no flag and no prompt — the exact
+                    // unrecoverable case the remote branch takes care over.
+                    if (!opts.allowDelete) {
+                        warn(
+                            `${path} is gone from your filesystem but still here — not deleting it locally.\n` +
+                            `  Pass --allow-delete to propagate deletions.`,
+                        );
+                        delete next[path];
+                        break;
+                    }
+                    if (!(await writable(localAbs))) {
+                        warn(`skipping ${path} — ${localAbs} is a symlink or not a regular file`);
+                        break;
+                    }
                     await rm(localAbs, { force: true });
                     delete next[path];
                     info(`✕ ${path} (removed there)`);
@@ -257,7 +362,7 @@ export async function importOnce({ client, dir, root, opts = {} }) {
     const { match, source } = await loadIgnores(dir, readFile);
     const [local, remote] = await Promise.all([
         scanLocal(dir, opts.hidden, match),
-        scanRemote(vfs, root),
+        scanRemote(vfs, root, opts.hidden, match),
     ]);
     const state = await loadState(dir, root);
     const plan = planSync({ last: state, local, remote });
