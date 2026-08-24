@@ -2,6 +2,23 @@
 
 All notable changes to `@muhkoo/cli` are documented here.
 
+## 0.12.0-alpha.0 — `muhkoo vcs`, bulk import, and `.vcsignore` (2026-08-24)
+
+### Added
+
+- **`muhkoo vcs` — version control for a project.** `status`, `commit -m`, `log`, `show`, `diff`, `branch`, `switch`, `checkout`, `merge`, `restore`. The project comes from your VFS working directory, so `muhkoo vfs cd /apps/my-app` then `muhkoo vcs log` does what you would expect; `--project <slug>` overrides it. Drives `client.vcs` through the SDK, because commit hashes come from a canonical encoding and a second implementation here would only have to agree with it byte-for-byte forever.
+- **`muhkoo vfs import <dir…>` — upload whole projects in one pass.** Several directories in ONE process on purpose: every invocation of the CLI unlocks the vault, and a shell loop over a dozen projects trips the auth rate limiter before it finishes. `--dry-run` lists what would go up and the total size before spending metered bytes.
+  - The destination defaults to the slug the project declares in `.muhkoo-app.json`, falling back to the directory name. This matters because the portal opens the IDE at `?app=<slug>` and the IDE reads `/apps/<slug>` — a project imported under its directory name is invisible to both wherever the two differ.
+- **`.vcsignore` — what not to sync.** Same syntax as `.gitignore` (`!` negation with last-match-wins, trailing `/` for directories, leading `/` to anchor, `*`, `**`, `?`, character classes), layered on top of built-in Node defaults. Resolution is `.vcsignore`, else `.gitignore`, else the defaults alone — so a project works before it opts in. `muhkoo vfs ignore [dir] [--write]` drafts one from the defaults plus the project's own `.gitignore`.
+  - Defaults cover dependencies, build output, logs, and `.env` / `.env.*` with `!.env.example` — uploading a `.env` by accident is the expensive mistake here.
+  - `.vcsignore` and `.gitignore` now travel with the project; every other dot-entry is still treated as machine state.
+
+### Fixed
+
+- **Sync state is scoped to the remote root.** It recorded which paths were in sync but not *where*, and `planSync` reads "present locally, in the state, absent remotely" as deleted on the other side — so re-pointing a directory at a different `--path` made every local file look deleted, and with `--allow-delete` they would have been. State from a different root is now ignored.
+- `-m`, `-n` and `-r` are read from the positionals. The shared argument parser only understands `--flags`, so `muhkoo vcs commit -m "…"` silently lost its message and `muhkoo vfs rm <path> -r` silently refused to recurse.
+- `muhkoo vfs ignore` no longer opens a client. Unlocking the vault to write a file on your own disk is both pointless and, in a loop, enough to trip the auth rate limiter.
+
 ## 0.10.11-alpha.0 — Access tokens + `muhkoo login` fix (2026-07-29)
 
 ### Fixed

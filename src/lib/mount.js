@@ -27,10 +27,16 @@ import { watch } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 
 import { planSync } from "./syncPlan.js";
+import { loadIgnores } from "./ignore.js";
 import { info, ok, warn } from "./ui.js";
 
-/** Never sync these. Build output and dependencies belong to the machine. */
-const IGNORE = new Set(["node_modules", "dist", "build", "coverage", "target", "vendor"]);
+/**
+ * Last-resort deny-list, used only for the watcher's fast path.
+ *
+ * The real rules come from `.vcsignore` (see `./ignore.js`); this exists so a
+ * filesystem event under `node_modules` can be dropped without a scan.
+ */
+const IGNORE = new Set(["node_modules", "dist", "build", "coverage", "target", "vendor", ".git"]);
 
 /**
  * Skip dot-entries by default.
@@ -45,6 +51,9 @@ const IGNORE = new Set(["node_modules", "dist", "build", "coverage", "target", "
  * for a project that genuinely keeps source there.
  */
 const isHidden = (name) => name.startsWith(".");
+
+/** Dot-files that describe the project rather than the machine. */
+const KEEP_HIDDEN = new Set([".vcsignore", ".gitignore"]);
 
 /**
  * Skip anything enormous.
@@ -62,21 +71,34 @@ const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 /** Where the last-synced view lives, inside the mount. */
 const statePath = (dir) => join(dir, ".muhkoo", "mount.json");
 
-async function loadState(dir) {
+/**
+ * The last-synced view, but ONLY if it describes the same remote root.
+ *
+ * State scoped to the directory alone is actively dangerous. It records "these
+ * paths were in sync", and `planSync` reads a path that is present locally and
+ * in the state but missing remotely as "deleted on the other side" — so pointing
+ * the same directory at a DIFFERENT root makes every local file look deleted,
+ * and with `--allow-delete` they would be. Re-rooting has to start from scratch.
+ */
+async function loadState(dir, root) {
     try {
-        return JSON.parse(await readFile(statePath(dir), "utf8"));
+        const saved = JSON.parse(await readFile(statePath(dir), "utf8"));
+        // Pre-versioning files were a bare path→hash map with no root recorded.
+        // They cannot be shown to be about this root, so they are not trusted.
+        if (!saved || saved.v !== 1 || saved.root !== root) return {};
+        return saved.paths ?? {};
     } catch {
-        return {};   // first mount, or someone cleared it — a full compare is safe
+        return {};   // first sync, or someone cleared it — a full compare is safe
     }
 }
 
-async function saveState(dir, state) {
+async function saveState(dir, root, paths) {
     await mkdir(dirname(statePath(dir)), { recursive: true });
-    await writeFile(statePath(dir), JSON.stringify(state, null, 2) + "\n");
+    await writeFile(statePath(dir), JSON.stringify({ v: 1, root, paths }, null, 2) + "\n");
 }
 
 /** Hash every syncable file under `dir`, keyed by VFS-style relative path. */
-async function scanLocal(dir, includeHidden = false) {
+async function scanLocal(dir, includeHidden = false, ignore = () => false) {
     const out = {};
     const walk = async (abs) => {
         let entries;
@@ -86,9 +108,15 @@ async function scanLocal(dir, includeHidden = false) {
             return;   // vanished mid-scan; the next pass will see it
         }
         for (const entry of entries) {
-            if (IGNORE.has(entry.name)) continue;
-            if (!includeHidden && isHidden(entry.name)) continue;
             const child = join(abs, entry.name);
+            const rel = relative(dir, child).split(sep).join("/");
+            // Pruned at the directory, not per file: never descend into
+            // node_modules to decide, file by file, not to sync it.
+            if (ignore(rel, entry.isDirectory())) continue;
+            // `.vcsignore` and `.gitignore` describe the project and belong with
+            // it; every other dot-entry is machine state until asked for.
+            const keepDotfile = KEEP_HIDDEN.has(entry.name);
+            if (!includeHidden && !keepDotfile && isHidden(entry.name)) continue;
             if (entry.isDirectory()) {
                 await walk(child);
                 continue;
@@ -128,7 +156,13 @@ async function scanRemote(vfs, root) {
  * silently lose ([[VfsNamespace]] consistency note).
  */
 async function reconcile({ vfs, dir, root, state, opts = {} }) {
-    const [local, remote] = await Promise.all([scanLocal(dir, opts.hidden), scanRemote(vfs, root)]);
+    // Re-read every pass: editing `.vcsignore` should take effect on the next
+    // sync, not require a restart.
+    const { match } = await loadIgnores(dir, readFile);
+    const [local, remote] = await Promise.all([
+        scanLocal(dir, opts.hidden, match),
+        scanRemote(vfs, root),
+    ]);
     const plan = planSync({ last: state, local, remote });
     if (!plan.length) return state;
 
@@ -202,8 +236,103 @@ async function reconcile({ vfs, dir, root, state, opts = {} }) {
             warn(`${path}: ${err?.message ?? err}`);
         }
     }
-    await saveState(dir, next);
+    await saveState(dir, root, next);
     return next;
+}
+
+/**
+ * Push a directory up once and stop — no watcher.
+ *
+ * The same scan, plan and reconcile `mount` uses, so the rules about what is
+ * skipped and what a delete means are defined in exactly one place. This is the
+ * command for "get this project into my filesystem"; `mount` is for "and keep it
+ * that way".
+ *
+ * One process means ONE vault unlock, which is the practical reason this exists
+ * rather than a shell loop over `vfs put`: unlocking per file trips the auth
+ * rate limiter well before a real project finishes uploading.
+ */
+export async function importOnce({ client, dir, root, opts = {} }) {
+    const vfs = client.vfs;
+    const { match, source } = await loadIgnores(dir, readFile);
+    const [local, remote] = await Promise.all([
+        scanLocal(dir, opts.hidden, match),
+        scanRemote(vfs, root),
+    ]);
+    const state = await loadState(dir, root);
+    const plan = planSync({ last: state, local, remote });
+
+    // Say what will happen before spending metered bytes. A project directory
+    // is easy to point at the wrong place, and the bytes are billed either way.
+    //
+    // Sizes are stat'd here rather than carried out of `scanLocal`, which
+    // returns hashes — the scan is shared with `mount`, and widening its return
+    // shape to serve one caller's progress line is not worth the churn.
+    const pushes = plan.filter((p) => p.action === "push");
+    const bytes = (
+        await Promise.all(
+            pushes.map(async ({ path }) => {
+                try {
+                    return (await stat(join(dir, path.slice(1).split("/").join(sep)))).size;
+                } catch {
+                    return 0;
+                }
+            }),
+        )
+    ).reduce((n, size) => n + size, 0);
+
+    if (opts.dryRun) {
+        if (!plan.length) return ok(`${root} already matches ${dir}.`);
+        for (const { path, action } of plan) info(`${SIGN[action] ?? "?"} ${path}`);
+        info(`\n${plan.length} change(s); ${pushes.length} file(s) to upload, ${human(bytes)}.`);
+        return info(`Ignoring per ${describeSource(source)}.`);
+    }
+
+    if (!plan.length) return ok(`${root} already matches ${dir} — nothing to do.`);
+    info(`Importing ${dir} → ${root} (${pushes.length} file(s), ${human(bytes)}; ignoring per ${describeSource(source)})`);
+    await reconcile({ vfs, dir, root, state, opts });
+    ok(`Imported into ${root}.`);
+    await noteStateFile(dir);
+}
+
+/**
+ * Mention the state file, once, in a repository that is not ignoring it.
+ *
+ * `.muhkoo/mount.json` is what makes a later import or mount incremental, so it
+ * has to live in the directory — but appearing as an untracked directory with no
+ * explanation is the kind of thing people delete, or commit by accident. Saying
+ * it here beats editing someone's `.gitignore` for them.
+ */
+async function noteStateFile(dir) {
+    try {
+        await stat(join(dir, ".git"));
+    } catch {
+        return;   // not a repository; nothing to explain
+    }
+    try {
+        const ignores = await readFile(join(dir, ".gitignore"), "utf8");
+        if (/^\.muhkoo\/?$/m.test(ignores)) return;
+    } catch {
+        // no .gitignore: still worth mentioning
+    }
+    info("  Tracking state is in .muhkoo/ — add it to .gitignore.");
+}
+
+const SIGN = {
+    push: "\u2191", pull: "\u2193", conflict: "!",
+    "delete-remote": "\u2715", "delete-local": "\u2715", forget: "\u00b7",
+};
+
+function describeSource(source) {
+    if (source === "defaults") return "the built-in Node defaults (write a .vcsignore to change them)";
+    if (source === ".gitignore") return ".gitignore (add a .vcsignore to diverge from it)";
+    return source;
+}
+
+function human(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /**
@@ -213,7 +342,7 @@ export async function mount({ client, dir, root, signal, opts = {} }) {
     const vfs = client.vfs;
     await mkdir(dir, { recursive: true });
 
-    let state = await loadState(dir);
+    let state = await loadState(dir, root);
     info(`Mounting ${root} → ${dir}`);
     state = await reconcile({ vfs, dir, root, state, opts });
     ok("In sync. Watching for changes — press Ctrl-C to stop.");

@@ -10,9 +10,10 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { openClient, explainWriteFailure } from "../lib/vfs.js";
-import { mount as mountDir } from "../lib/mount.js";
+import { mount as mountDir, importOnce } from "../lib/mount.js";
+import { draftIgnores } from "../lib/ignore.js";
 import { loadConfig, saveConfig } from "../lib/config.js";
-import { table, json, ok, info, die } from "../lib/ui.js";
+import { table, json, ok, info, warn, die } from "../lib/ui.js";
 
 export const help = `muhkoo vfs — your encrypted filesystem
 
@@ -32,11 +33,17 @@ Usage:
   muhkoo vfs find <glob>                 e.g. '/apps/**/*.ts'
   muhkoo vfs history <path>              prior versions, newest first
   muhkoo vfs restore <path> [index]      restore a version (default 0)
+  muhkoo vfs ignore [dir] [--write]      draft a .vcsignore from the Node
+                                        defaults + the project's .gitignore
+  muhkoo vfs import <dir…> [--path <p>]  upload whole projects (once, then stop)
   muhkoo vfs mount <dir> [--path <p>]    sync a subtree to disk and keep it live
                                         (dot-files skipped; deletes need --allow-delete)
   muhkoo vfs sweep [--force]             reclaim orphaned records
   muhkoo vfs use-app <domain>            use an app, by the domain you use it at
   muhkoo vfs app                         show which app you are writing as
+
+What gets synced is decided by .vcsignore, or .gitignore if there is none, or
+built-in Node defaults if there is neither. \`muhkoo vfs ignore\` drafts one.
 
 Reading your files is free. WRITING stores bytes, which are metered to an
 app — so put, rm, cp, mv and restore need an app signed in first.
@@ -48,11 +55,19 @@ Options:
   --allow-delete propagate local deletions. OFF by default: a delete removes
                  the file's history too, so unlike an overwrite it cannot be undone
   --hidden       also sync dot-files and dot-directories
+  --dry-run      (import) list what would be uploaded, and the total size,
+                 without writing anything
   --no-pair      unlock for this command only; pair nothing to this machine`;
 
 export default async function vfs(args) {
   const sub = args._[1];
   if (sub === undefined) return die("Missing subcommand. See `muhkoo vfs --help`.");
+
+  // Purely local subcommands run BEFORE the client exists. Unlocking the vault
+  // to write a file on this disk is both pointless and expensive: each unlock
+  // is a vault read, and a loop over a dozen projects trips the auth rate
+  // limiter long before it finishes.
+  if (sub === "ignore") return writeIgnores(args);
 
   const client = await openClient(args);
   const fs = client.vfs;
@@ -142,8 +157,12 @@ export default async function vfs(args) {
       return ok(`Created ${a(2)}`);
 
     case "rm": {
-      const path = required(a(2), "rm <path>");
-      await fs.delete(path, { recursive: Boolean(args.r || args.recursive) });
+      // `-r` arrives as a POSITIONAL: the shared parser only understands
+      // `--flags`. Filter it out before reading the path, so `rm -r <path>` and
+      // `rm <path> -r` both work and neither tries to delete a file named "-r".
+      const recursive = args._.includes("-r") || Boolean(args.r || args.recursive);
+      const path = required(args._.filter((t) => t !== "-r")[2], "rm <path> [-r]");
+      await fs.delete(path, { recursive });
       return ok(`Deleted ${path}`);
     }
 
@@ -205,6 +224,36 @@ export default async function vfs(args) {
       return info(`Writing as "${slug}".`);
     }
 
+    case "import":
+    case "push": {
+      const dirs = args._.slice(2);
+      if (!dirs.length) return die("Usage: muhkoo vfs import <dir…> [--path /apps/<slug>]");
+      // `--path` names ONE destination, so it cannot mean anything sensible for
+      // several directories at once.
+      if (dirs.length > 1 && args.path) {
+        return die("--path takes a single directory. Without it each one goes to /apps/<its name>.");
+      }
+
+      // Several directories in ONE process, on purpose: every invocation of the
+      // CLI unlocks the vault, and a shell loop over a dozen projects trips the
+      // auth rate limiter before it finishes.
+      const opts = {
+        hidden: Boolean(args.hidden),
+        allowDelete: Boolean(args["allow-delete"]),
+        dryRun: Boolean(args["dry-run"]),
+      };
+      for (const d of dirs) {
+        const root = normalizeRoot(args.path ?? `/apps/${await slugFor(resolve(d))}`);
+        try {
+          await importOnce({ client, dir: resolve(d), root, opts });
+        } catch (err) {
+          // One unreadable project must not abandon the other twelve.
+          warn(`${d}: ${err?.message ?? err}`);
+        }
+      }
+      return;
+    }
+
     case "mount": {
       const dir = required(a(2), "mount <dir> [--path /apps]");
       const root = normalizeRoot(args.path ?? "/");
@@ -233,6 +282,44 @@ export default async function vfs(args) {
       return die(`Unknown subcommand "vfs ${sub}". See \`muhkoo vfs --help\`.`);
   }
   }
+}
+
+/**
+ * Draft or write a `.vcsignore`. Local only — no session, no network.
+ */
+async function writeIgnores(args) {
+  const dir = resolve(args._[2] ?? ".");
+  const target = `${dir}/.vcsignore`;
+  const existing = await readFile(target, "utf8").catch(() => null);
+  if (existing && !args.force) {
+    return die(`${target} already exists. Pass --force to replace it.`);
+  }
+  const draft = draftIgnores(await readFile(`${dir}/.gitignore`, "utf8").catch(() => ""));
+  if (!args.write) {
+    process.stdout.write(draft);
+    return info(`\n(nothing written — pass --write to save this to ${target})`);
+  }
+  await writeFile(target, draft);
+  return ok(`Wrote ${target}`);
+}
+
+/**
+ * Where a project belongs in the filesystem.
+ *
+ * The app's own slug when the directory declares one, because that is the name
+ * everything else addresses it by: the portal opens the IDE at `?app=<slug>`,
+ * and the IDE reads `/apps/<slug>`. A project imported under its DIRECTORY name
+ * is invisible to both whenever the two differ — which they do for half of these
+ * (`portfolio` is `mattgagliardo`, `theater` is `muhkoo-theater`).
+ *
+ * Falls back to the directory name, which is right for a project that is not
+ * deployed anywhere yet.
+ */
+async function slugFor(dir) {
+  const declared = await readFile(`${dir}/.muhkoo-app.json`, "utf8")
+    .then((raw) => JSON.parse(raw).slug)
+    .catch(() => null);
+  return declared || basename(dir);
 }
 
 function required(value, usage) {

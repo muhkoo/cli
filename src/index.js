@@ -21,6 +21,7 @@ const COMMANDS = {
   deploy: () => import("./commands/deploy.js"),
   promote: () => import("./commands/promote.js"),
   vfs: () => import("./commands/vfs.js"),
+  vcs: () => import("./commands/vcs.js"),
   devices: () => import("./commands/devices.js"),
   hosting: () => import("./commands/hosting.js"),
   domains: () => import("./commands/domains.js"),
@@ -55,6 +56,7 @@ Backend
 
 Files
   vfs ls|cat|put|get|rm|cp|mv|find|history|restore
+  vcs status|commit|log|diff|branch|switch|merge
                          your encrypted filesystem
 
 Hosting
