@@ -63,6 +63,14 @@ const KEEP_HIDDEN = new Set([".vcsignore", ".gitignore"]);
  */
 const MAX_BYTES = 100 * 1024 * 1024;
 
+/**
+ * How many files to read at once.
+ *
+ * Enough to hide per-request latency; low enough not to open a connection per
+ * file on a large project.
+ */
+const READ_CONCURRENCY = 8;
+
 /** Coalesce editor churn — a save is often several events in a few ms. */
 const SETTLE_MS = 250;
 
@@ -155,6 +163,10 @@ async function scanLocal(dir, includeHidden = false, ignore = () => false) {
 export async function scanRemote(vfs, root, includeHidden = false, ignore = () => false) {
     const out = {};
     if (!(await vfs.exists(root))) return out;
+
+    // Decide what to read BEFORE reading anything, so the filters are applied
+    // once and the reads that survive them can go out together.
+    const wanted = [];
     for (const abs of await vfs.walk(root)) {
         const key = abs.slice(root.length) || "/" + abs.split("/").pop();
         const rel = key.replace(/^\//, "");
@@ -167,8 +179,22 @@ export async function scanRemote(vfs, root, includeHidden = false, ignore = () =
         // Same dot-entry rule as `scanLocal`, applied to every segment: a remote
         // `.vscode/tasks.json` is as dangerous as a remote `.vscode`.
         if (!includeHidden && rel.split("/").some((part) => isHidden(part) && !KEEP_HIDDEN.has(part))) continue;
-        out[key] = sha(await vfs.readFile(abs));
+        wanted.push([key, abs]);
     }
+
+    // Read in PARALLEL. Each file is an independent round trip - a manifest
+    // lookup plus its shards - so reading them one after another cost the SUM
+    // of the latencies. On a project of any size that is the difference between
+    // `mount` taking a moment and looking like it has hung: doodledottie is 38
+    // files and 16.5MB, which took over twenty seconds in series.
+    const queue = [...wanted];
+    await Promise.all(
+        Array.from({ length: Math.min(READ_CONCURRENCY, queue.length) }, async () => {
+            for (let item = queue.shift(); item !== undefined; item = queue.shift()) {
+                out[item[0]] = sha(await vfs.readFile(item[1]));
+            }
+        }),
+    );
     return out;
 }
 

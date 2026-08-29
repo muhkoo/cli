@@ -2,6 +2,12 @@
 
 All notable changes to `@muhkoo/cli` are documented here.
 
+## 0.13.2-alpha.0 — `mount` and `import` read in parallel (2026-08-29)
+
+### Fixed
+
+- **`scanRemote` reads files concurrently instead of one at a time**, which is what made `muhkoo vfs mount` look like it had hung on anything of size. Each read is an independent round trip (a manifest lookup plus its shards), so doing them in series cost the sum of the latencies. Measured on doodledottie — 38 files, 16.5MB — the scan went from **10974ms to 3143ms**. Affects `mount` and `import` alike, and the filters now run once up front rather than being interleaved with the reads.
+
 ## 0.13.1-alpha.0 — faster `vfs tree`, `mount` and `import` (2026-08-29)
 
 ### Fixed
