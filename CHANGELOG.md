@@ -2,6 +2,12 @@
 
 All notable changes to `@muhkoo/cli` are documented here.
 
+## 0.13.1-alpha.0 — faster `vfs tree`, `mount` and `import` (2026-08-29)
+
+### Fixed
+
+- Picks up `@muhkoo/connect@0.13.1-alpha.0`, where `vfs.walk` lists sibling directories concurrently rather than one at a time. Every command that enumerates the filesystem — `tree`, `find`, `mount`, `import`, `sweep` — spent 1–2s walking before it did anything. Output order is unchanged.
+
 ## 0.13.0-alpha.0 — the sync no longer trusts what comes down (2026-08-24)
 
 ### Security
