@@ -1,9 +1,12 @@
 # Security Policy
 
-The `muhkoo` CLI handles developer credentials: it stores a session token in
-`~/.muhkoo/config.json`, runs a browser-based (loopback OAuth + PKCE) sign-in,
-and reads app secret keys from `.muhkoo-app.json` to deploy. We take
-vulnerabilities seriously and appreciate responsible disclosure.
+The `muhkoo` CLI handles developer credentials: it stores a session token and,
+once a machine is paired, a device key in `~/.muhkoo/config.json`; it runs a
+browser-based (loopback OAuth + PKCE) sign-in; and it reads app secret keys from
+`.muhkoo-app.json` to deploy. The device key is not the master seed — the seed
+is never written to disk — but it unwraps a vault-held copy of it for as long as
+the pairing stands, so treat it as equivalent. `muhkoo devices rm` withdraws it.
+We take vulnerabilities seriously and appreciate responsible disclosure.
 
 ## Reporting a vulnerability
 

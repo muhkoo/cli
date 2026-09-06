@@ -9,10 +9,14 @@ Built on top of [`@muhkoo/connect`](https://www.npmjs.com/package/@muhkoo/connec
 ## Install
 
 ```bash
-npm install -g @muhkoo/cli
+npm install -g @muhkoo/cli@alpha
 # or run without installing:
-npx @muhkoo/cli --help
+npx @muhkoo/cli@alpha --help
 ```
+
+Ask for the **`alpha`** tag explicitly. `latest` still points at the older
+`0.13.2-alpha.0` line, so a bare install gets a CLI without the commands
+documented here.
 
 Requires Node.js 20+.
 
@@ -62,6 +66,27 @@ in `~/.muhkoo/config.json`. You can override per-invocation:
 `deploy` also accepts an app **secret key** (`--key mk_*_sk_*` or `MUHKOO_DEPLOY_KEY`),
 which is what CI typically uses.
 
+### Paired machines
+
+Commands that open your encrypted filesystem (`vfs`, `vcs`, and `devices`
+itself) need the master seed as well as a session, and the seed is never stored
+on disk. The first such command signs you in once and **pairs this machine**: it
+generates a key here,
+asks the vault to hold your seed wrapped under it, and keeps only the key. So
+nothing on this disk is the seed, and the pairing can be withdrawn from anywhere
+— which a stored seed never could be, because nothing can reach out and un-store
+it.
+
+```bash
+muhkoo devices ls              # paired machines; the current one is marked
+muhkoo devices rm <factorId>   # withdraw access — takes effect immediately
+```
+
+Revoking the machine you are on also clears its now-useless local key, so the
+next filesystem command pairs again from scratch rather than retrying a pairing
+the server has forgotten. `MUHKOO_SEED` bypasses pairing entirely, for CI, where
+there is no interactive login to pair with.
+
 ## Environments
 
 `--base` selects the API base for any command:
@@ -77,9 +102,10 @@ muhkoo whoami  --base https://api.example.com
 ## Commands
 
 ```
-Account     login · logout · whoami
-Apps        apps ls|get|create|slug|rm · keys rotate
+Account     login · logout · devices ls|rm · whoami
+Apps        apps ls|get|create|slug|rm · keys rotate · tokens ls|create|revoke
 Backend     provision · tables · agents · functions
+Files       vfs ls|cat|put|get|rm|cp|mv|find|history|restore · vcs status|commit|log|diff|branch|switch|merge
 Hosting     deploy · promote · hosting status|rollback|rm-release|unpublish · domains
 Tools       logs · eject
 ```
