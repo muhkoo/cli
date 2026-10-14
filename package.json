@@ -5,7 +5,10 @@
   "type": "module",
   "license": "MIT",
   "author": "muhkoo",
-  "repository": "https://github.com/muhkoo/cli.git",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/muhkoo/cli.git"
+  },
   "homepage": "https://docs.muhkoo.dev",
   "bugs": "https://github.com/muhkoo/cli/issues",
   "keywords": [
