@@ -4,6 +4,14 @@ All notable changes to `@muhkoo/cli` are documented here.
 
 ## Unreleased
 
+## 0.15.0-alpha.9 — dependency security patches (2026-10-14)
+
+Released with @muhkoo/connect 0.15.0-alpha.9 (dependency patches only, no SDK behaviour change), and published with `npm run release`: both `alpha` and `latest` point at it.
+
+### Security
+
+- **`npm audit` is clean.** The lockfile now resolves `jsonpath` ^1.3.0 and `underscore` ^1.13.8 under `snarkjs` → `bfj`, and the test runner moves from `vitest` 2 to 4.1.11, which clears the `vitest`, `vite`, `esbuild` and `tinypool` advisories. No command changes.
+
 ## 0.15.0-alpha.8 — an emptied mount folder downloads again (2026-10-14)
 
 Released with @muhkoo/connect 0.15.0-alpha.8 (no SDK changes), and published with `npm run release`: both `alpha` and `latest` point at it.
