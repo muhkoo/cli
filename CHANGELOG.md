@@ -4,6 +4,19 @@ All notable changes to `@muhkoo/cli` are documented here.
 
 ## Unreleased
 
+## 0.15.0-alpha.6 — faster `vfs mount` (2026-10-14)
+
+Released with @muhkoo/connect 0.15.0-alpha.6, and published with `npm run release`: both `alpha` and `latest` point at it.
+
+### Changed
+
+- **`vfs mount` downloads several files at once.** Pulls run 8 at a time and the scan reads 16 at a time, each within 64 MiB of reads in flight, so a tree with large files syncs about twice as fast.
+- **Built on @muhkoo/connect 0.15.0-alpha.6**, which reads large files two chunks ahead (about 40% faster).
+
+### Fixed
+
+- **A file record without a valid size can no longer stall the scan.** It counts as 0, and a read too large for the window is released as soon as it is done.
+
 ## 0.15.0-alpha.5 — moves to @muhkoo/connect 0.15.0-alpha.5 (2026-10-10)
 
 Released with @muhkoo/connect 0.15.0-alpha.5, and published with `npm run release`: both `alpha` and `latest` point at it. The CLI's own code is unchanged from 0.15.0-alpha.4.
