@@ -359,11 +359,41 @@ describe("the mass-delete circuit breaker [N1]", () => {
         expect(lines.filter((l) => /refusing to delete 10 of 10/.test(l))).toHaveLength(1);
     });
 
-    it("holds remote deletes when the local tree is suddenly empty", async () => {
+    it("downloads everything again when the local tree is suddenly empty", async () => {
         const { vfs, dir, state } = await synced(10);
         await rm(join(dir, "src"), { recursive: true });
+        const next = await reconcile({ vfs, dir, root: "/apps/p", state, opts: { allowDelete: true } });
+        expect((await vfs.walk("/apps/p")).length).toBe(10);
+        expect((await readdir(join(dir, "src"))).sort()).toEqual(Array.from({ length: 10 }, (_, i) => `f${i}.ts`).sort());
+        expect(await read(join(dir, "src", "f3.ts"))).toBe("f3");
+        const fileKeys = (s) => Object.keys(s).filter((k) => !k.endsWith("/")).sort();
+        expect(fileKeys(next)).toEqual(fileKeys(state));
+        expect(lines.filter((l) => /holds nothing at all/.test(l) && /back down/.test(l))).toHaveLength(1);
+        expect(lines.some((l) => /refusing to delete/.test(l))).toBe(false);
+    });
+
+    it("downloads again without --allow-delete too", async () => {
+        const { vfs, dir, state } = await synced(4);
+        await rm(join(dir, "src"), { recursive: true });
+        await reconcile({ vfs, dir, root: "/apps/p", state });
+        expect((await readdir(join(dir, "src"))).length).toBe(4);
+    });
+
+    it("still holds remote deletes when the files are gone but the folders stay", async () => {
+        const { vfs, dir, state } = await synced(10);
+        for (let i = 0; i < 10; i++) await rm(join(dir, "src", `f${i}.ts`));
         await reconcile({ vfs, dir, root: "/apps/p", state, opts: { allowDelete: true } });
         expect((await vfs.walk("/apps/p")).length).toBe(10);
+        expect((await readdir(join(dir, "src"))).length).toBe(0);
+        expect(lines.some((l) => /refusing to delete 10 of 10/.test(l))).toBe(true);
+    });
+
+    it("still holds when most files, but not all, are gone", async () => {
+        const { vfs, dir, state } = await synced(10);
+        for (let i = 0; i < 9; i++) await rm(join(dir, "src", `f${i}.ts`));
+        await reconcile({ vfs, dir, root: "/apps/p", state, opts: { allowDelete: true } });
+        expect((await vfs.walk("/apps/p")).length).toBe(10);
+        expect((await readdir(join(dir, "src")))).toEqual(["f9.ts"]);
     });
 
     it("still lets ordinary deletions through", async () => {
@@ -2729,6 +2759,40 @@ describe("folders sync as well as files", () => {
         await vfs.delete("/old", { recursive: true });
         state = await reconcile({ vfs, dir, root: "/", state, opts: { allowDelete: true } });
         expect(await isDir(join(dir, "old", "empty"))).toBe(true);
+    });
+
+    it("a wiped mount folder gets its folders back, and the remote keeps them", async () => {
+        const { vfs } = realVfs();
+        await vfs.writeFile("/docs/a.txt", enc("a"));
+        await vfs.mkdir("/docs/empty", { recursive: true });
+        await vfs.mkdir("/Drive/Stuff", { recursive: true });
+        const dir = await tmp("dirs-wiped");
+        let state = await reconcile({ vfs, dir, root: "/", state: {}, opts: { allowDelete: true } });
+        for (const name of await readdir(dir)) if (name !== ".muhkoo") await rm(join(dir, name), { recursive: true });
+        state = await reconcile({ vfs, dir, root: "/", state, opts: { allowDelete: true } });
+        expect(await remoteKind(vfs, "/docs/empty")).toBe("dir");
+        expect(await remoteKind(vfs, "/Drive/Stuff")).toBe("dir");
+        expect(await isDir(join(dir, "docs", "empty"))).toBe(true);
+        expect(await isDir(join(dir, "Drive", "Stuff"))).toBe(true);
+        expect(await read(join(dir, "docs", "a.txt"))).toBe("a");
+        // and the next pass is quiet
+        const before = lines.length;
+        await reconcile({ vfs, dir, root: "/", state, opts: { allowDelete: true } });
+        expect(await remoteKind(vfs, "/Drive/Stuff")).toBe("dir");
+        expect(lines.slice(before).filter((l) => /holds nothing at all/.test(l))).toEqual([]);
+    });
+
+    it("a wiped mount folder that tracked only folders keeps them on the remote", async () => {
+        const { vfs } = realVfs();
+        await vfs.mkdir("/a/b", { recursive: true });
+        await vfs.mkdir("/c", { recursive: true });
+        const dir = await tmp("dirs-wiped-only");
+        let state = await reconcile({ vfs, dir, root: "/", state: {}, opts: { allowDelete: true } });
+        for (const name of await readdir(dir)) if (name !== ".muhkoo") await rm(join(dir, name), { recursive: true });
+        state = await reconcile({ vfs, dir, root: "/", state, opts: { allowDelete: true } });
+        expect(await remoteKind(vfs, "/a/b")).toBe("dir");
+        expect(await remoteKind(vfs, "/c")).toBe("dir");
+        expect(await isDir(join(dir, "a", "b"))).toBe(true);
     });
 
     it("never removes a folder that still holds a file that is not synced", async () => {

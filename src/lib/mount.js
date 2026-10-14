@@ -1904,10 +1904,26 @@ async function preparePass({ vfs, dir, rulesDir = dir, root, state, opts, sess, 
     const unknown = new Set([...local.unknown, ...remote.unknown]);
     const files = filesOf(state);
     const planned = planSync({ last: files, local: local.files, remote: remote.files, unknown });
-    const views = { local: Object.keys(local.files).length, remote: Object.keys(remote.files).length };
+    const views = {
+        local: Object.keys(local.files).length,
+        remote: Object.keys(remote.files).length,
+        // No files and no folders here: a mount folder emptied to start
+        // again, and its files come back down. What the scan left alone (the
+        // mount's own .muhkoo, .DS_Store, a symlink) does not count, as no
+        // pull is planned over it; a path the ignore rules hold back does.
+        bare: !Object.keys(local.files).length && !local.dirs.length && !local.held.size,
+    };
     sess.peak = Math.max(sess.peak ?? 0, Object.keys(files).length);
-    const { plan, held } = holdMassDeletes(planned, files, views, sess.peak);
+    const { plan, held, restored } = holdMassDeletes(planned, files, views, sess.peak);
     for (const h of held) warnOnce(sess, `held:${h.action}:${h.count}`, ...breakerMessage(h, dir, root));
+    if (restored) {
+        warnOnce(
+            sess,
+            `restored:${restored}`,
+            `${dir} holds nothing at all, so its ${restored} file${restored === 1 ? "" : "s"} come${restored === 1 ? "s" : ""} back down from ${root} rather than being deleted there.`,
+            `  To delete them from your filesystem instead, use: muhkoo vfs rm -r <path>`,
+        );
+    }
     // Folders after files, by the same rule. When the breaker held file
     // deletes, no folder is removed either: the same pass would empty them.
     let dirPlan = planDirs({
@@ -1918,6 +1934,9 @@ async function preparePass({ vfs, dir, rulesDir = dir, root, state, opts, sess, 
         fold: sess.ignoreCase ? caseFold : null,
     });
     if (held.length) dirPlan = dirPlan.filter(({ action }) => !action.startsWith("rmdir"));
+    // A bare mount folder gets its folders back too, rather than taking them
+    // from the remote.
+    else if (views.bare) dirPlan = dirPlan.map((p) => (p.action === "rmdir-remote" ? { path: p.path, action: "mkdir-local" } : p));
     return {
         plan, dirPlan, local: local.files, remote: remote.files, sizes: remote.sizes, blobs: remote.blobs, ignores,
         unreadable: remote.unreadable, deferred: remote.deferred,

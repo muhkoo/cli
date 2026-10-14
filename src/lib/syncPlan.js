@@ -191,6 +191,15 @@ function coveredBy(prefixes) {
  * as they were: the next pass sees the same picture rather than "forgotten
  * files" to copy back.
  *
+ * One broken view is answered rather than held: a local side that holds
+ * nothing at all (`views.bare`: no files, no folders, nothing refused or
+ * unreadable) — a mount folder emptied to start again. Its remote deletes
+ * become pulls and `restored` counts them, so the files come back instead of
+ * the user deleting the state file by hand. Nothing local can be overwritten,
+ * as there is nothing local, and nothing remote is deleted. An empty REMOTE is
+ * never answered this way: there an empty view more likely means a renamed or
+ * missing root, and uploading everything again would put it in the wrong place.
+ *
  * What this is NOT: a defence against whatever can write the filesystem. It
  * catches broken views — a renamed root, an empty walk, a wiped checkout. A
  * remote party can add filler files first, so that its deletions are a
@@ -203,13 +212,16 @@ export function holdMassDeletes(plan, last, views = {}, peak = 0) {
     const tracked = Object.keys(last).length;
     const most = Math.max(tracked, peak);
     const held = [];
+    let restored = 0;
     for (const [action, other] of [["delete-local", "remote"], ["delete-remote", "local"]]) {
         const count = plan.filter((p) => p.action === action).length;
         if (!count) continue;
-        if (views[other] === 0) held.push({ action, count, tracked, empty: true });
+        if (action === "delete-remote" && views.local === 0 && views.bare === true) restored = count;
+        else if (views[other] === 0) held.push({ action, count, tracked, empty: true });
         else if (count > MASS_DELETE_FLOOR && tracked - count < most / 2) held.push({ action, count, tracked });
     }
-    if (!held.length) return { plan, held };
+    if (restored) plan = plan.map((p) => (p.action === "delete-remote" ? { path: p.path, action: "pull" } : p));
+    if (!held.length) return { plan, held, restored };
     const holding = new Set(held.map((h) => h.action));
-    return { plan: plan.filter((p) => !holding.has(p.action)), held };
+    return { plan: plan.filter((p) => !holding.has(p.action)), held, restored };
 }

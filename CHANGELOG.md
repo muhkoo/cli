@@ -4,6 +4,14 @@ All notable changes to `@muhkoo/cli` are documented here.
 
 ## Unreleased
 
+## 0.15.0-alpha.8 — an emptied mount folder downloads again (2026-10-14)
+
+Released with @muhkoo/connect 0.15.0-alpha.8 (no SDK changes), and published with `npm run release`: both `alpha` and `latest` point at it.
+
+### Fixed
+
+- **Emptying a mount folder no longer stalls the mount.** When the folder holds no files and no folders at all (only the mount's own `.muhkoo`, or files like `.DS_Store` that never sync), the mount now downloads everything again instead of refusing to delete it all from your filesystem and asking you to remove `.muhkoo/mount.json`. Folders come back too, and nothing is deleted remotely. To delete the files from your filesystem instead, use `muhkoo vfs rm -r <path>`. A folder that still holds folders, or some of its files, is still held by the mass-delete breaker, and so is a remote side that comes back empty.
+
 ## 0.15.0-alpha.7 — `vfs mount` restarts in seconds, and syncs folders (2026-10-14)
 
 Released with @muhkoo/connect 0.15.0-alpha.7 (no SDK changes), and published with `npm run release`: both `alpha` and `latest` point at it.

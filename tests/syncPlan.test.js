@@ -173,6 +173,30 @@ describe("holdMassDeletes: an empty view deletes nothing [review]", () => {
         expect(held.map((h) => h.action)).toEqual(["delete-remote"]);
     });
 
+    it("brings everything back down when the local side holds nothing at all", () => {
+        // A wiped mount folder: no files, no folders. Nothing local can be
+        // lost by downloading again, and nothing remote is deleted.
+        const plan = [...deletes(5, "delete-remote"), { path: "/new", action: "pull" }];
+        const out = holdMassDeletes(plan, tracked(5), { local: 0, remote: 6, bare: true });
+        expect(out.held).toEqual([]);
+        expect(out.restored).toBe(5);
+        expect(out.plan.map((p) => p.action)).toEqual(Array(6).fill("pull"));
+        expect(out.plan.map((p) => p.path).sort()).toEqual([...deletes(5).map((d) => d.path), "/new"].sort());
+    });
+
+    it("still holds when the local side has no files but still has folders", () => {
+        const out = holdMassDeletes(deletes(5, "delete-remote"), tracked(5), { local: 0, remote: 5, bare: false });
+        expect(out.plan).toEqual([]);
+        expect(out.restored).toBe(0);
+        expect(out.held.map((h) => h.action)).toEqual(["delete-remote"]);
+    });
+
+    it("never restores in the other direction: an empty remote stays held", () => {
+        const out = holdMassDeletes(deletes(5, "delete-local"), tracked(5), { local: 5, remote: 0, bare: false });
+        expect(out.restored).toBe(0);
+        expect(out.held.map((h) => h.action)).toEqual(["delete-local"]);
+    });
+
     it("still lets a small deletion through when both views have files", () => {
         expect(holdMassDeletes(deletes(3, "delete-local"), tracked(3), { local: 3, remote: 1 }).held).toEqual([]);
     });
