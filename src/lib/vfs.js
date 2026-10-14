@@ -23,8 +23,41 @@ import { die, info, step, prompt, promptHidden } from "./ui.js";
  *
  * Returns the client so callers can reach `client.vfs` — and anything else the
  * SDK offers — rather than a narrow wrapper that would drift from it.
+ *
+ * `args.readOnly` (a dry run) saves nothing to ~/.muhkoo: no pairing, no reset
+ * of a stale working directory, and a revoked pairing is reported but left for
+ * the next ordinary command to forget. `--no-pair` (or `pair: false`) skips the
+ * pairing alone, unlocking for this command only.
  */
 export async function openClient(args) {
+  const { cfg, baseUrl, client } = await restoreSession(args);
+
+  await unlock({ args, cfg, baseUrl, client });
+
+  // Restore the working directory. A CLI is a fresh process each time, so `cd`
+  // only means anything if it survives between invocations — the same reason a
+  // shell keeps PWD. A directory that has since been deleted silently falls
+  // back to the root rather than making every later command fail.
+  if (cfg.vfsCwd && cfg.vfsCwd !== "/") {
+    await client.vfs.cd(cfg.vfsCwd).catch(async () => {
+      if (!args.readOnly) await saveConfig({ ...cfg, vfsCwd: "/" });
+      info(`Working directory ${cfg.vfsCwd} is gone — back to /.`);
+    });
+  }
+  return client;
+}
+
+/**
+ * A Client with the session restored and NOTHING unlocked, for commands that
+ * only name things (`kv ls`) and never decrypt a value. Unlocking would ask for
+ * a password, or pair this machine, for nothing. Saves nothing to ~/.muhkoo.
+ */
+export async function openSession(args) {
+  return (await restoreSession(args)).client;
+}
+
+/** The Client both of the above start from: signed in, session verified, not unlocked. */
+async function restoreSession(args) {
   const cfg = await loadConfig();
   const baseUrl = await resolveBase(args, cfg);
   const token = args.token || process.env.MUHKOO_DEV_TOKEN || cfg.token;
@@ -56,20 +89,7 @@ export async function openClient(args) {
   // which would wipe a seed we had already put there.
   const user = await client.auth.zk.restore();
   if (!user) die("Your session has expired. Run `muhkoo login` and try again.");
-
-  await unlock({ args, cfg, baseUrl, client });
-
-  // Restore the working directory. A CLI is a fresh process each time, so `cd`
-  // only means anything if it survives between invocations — the same reason a
-  // shell keeps PWD. A directory that has since been deleted silently falls
-  // back to the root rather than making every later command fail.
-  if (cfg.vfsCwd && cfg.vfsCwd !== "/") {
-    await client.vfs.cd(cfg.vfsCwd).catch(async () => {
-      await saveConfig({ ...cfg, vfsCwd: "/" });
-      info(`Working directory ${cfg.vfsCwd} is gone — back to /.`);
-    });
-  }
-  return client;
+  return { cfg, baseUrl, client };
 }
 
 /**
@@ -100,19 +120,27 @@ async function unlock({ args, cfg, baseUrl, client }) {
       // password prompt would quietly re-pair a machine whose access was
       // deliberately withdrawn.
       if (/revoked|no longer paired/i.test(msg)) {
-        await saveConfig({ ...cfg, deviceFactorId: undefined, deviceKey: undefined });
+        if (!args.readOnly) await saveConfig({ ...cfg, deviceFactorId: undefined, deviceKey: undefined });
         die(msg);
       }
-      info(`Stored device key did not work (${msg}) — signing in to re-pair.`);
+      info(`Stored device key did not work (${msg}) — signing in${pairs(args) ? " to re-pair" : " for this command only"}.`);
     }
   }
 
   await pairThisMachine({ args, cfg, baseUrl, client });
 }
 
-/** Sign in once, pair this machine, and unlock the passed client. */
+/**
+ * Sign in once, pair this machine, and unlock the passed client — or, with
+ * `--no-pair` or read-only, sign in and unlock for this command alone.
+ */
 async function pairThisMachine({ args, cfg, baseUrl, client }) {
-  info("This machine is not paired yet — signing in once to pair it.");
+  const pairing = pairs(args);
+  info(
+    pairing
+      ? "This machine is not paired yet — signing in once to pair it."
+      : "This machine is not paired — signing in for this command only; nothing is stored.",
+  );
   const username = args.username || cfg.username || (await prompt("Username: "));
   const password = args.password || process.env.MUHKOO_PASSWORD || (await promptHidden("Password: "));
   if (!username || !password) die("A username and password are required to pair this machine.");
@@ -127,8 +155,8 @@ async function pairThisMachine({ args, cfg, baseUrl, client }) {
   const seed = authed.auth.zk.seedBase64;
   if (!seed) die("Signed in, but no encryption key was recovered — the account may have no password factor.");
 
-  if (args.pair === false) {
-    client.auth.zk.unlockWithSeed(seed);   // --no-pair: unlock now, store nothing
+  if (!pairing) {
+    client.auth.zk.unlockWithSeed(seed);   // unlock now, store nothing
     return;
   }
 
@@ -139,6 +167,16 @@ async function pairThisMachine({ args, cfg, baseUrl, client }) {
   await saveConfig({ ...cfg, username, deviceFactorId: factorId, deviceKey, seed: undefined });
   client.auth.zk.unlockWithSeed(seed);
   info(`Paired this machine as "${label}". Revoke it any time: muhkoo devices rm ${factorId}`);
+}
+
+/**
+ * Does this command pair a machine that is not paired? Not with `--no-pair`,
+ * and not read-only. The parser hands `--no-pair` over as `"no-pair": true`
+ * (or the word after it); only `pair: false` was ever read, so the flag did
+ * nothing.
+ */
+function pairs(args) {
+  return args.pair !== false && !args["no-pair"] && !args.readOnly;
 }
 
 /** A name the owner will recognise in `muhkoo devices ls`. */
@@ -162,7 +200,8 @@ function resolveAppKey(args, cfg) {
 }
 
 /**
- * Turn the shard store's 401 into an instruction.
+ * Turn the shard store's 401 into an instruction: the lines to print, or null
+ * when `err` is some other failure.
  *
  * "API key required to store shards" is accurate and useless — it names a
  * concept the person at the terminal has no reason to know, and says nothing
@@ -170,13 +209,12 @@ function resolveAppKey(args, cfg) {
  */
 export function explainWriteFailure(err, cfg) {
   const msg = err?.message ?? String(err);
-  if (!/API key required|store shards|401/.test(msg)) return msg;
+  if (!/API key required|store shards|401/.test(msg)) return null;
   const known = Object.keys(cfg?.vfsApps ?? {});
-  return (
-    "Writing stores bytes, which are metered to an app — so a write needs one signed in.\n" +
-    (known.length
-      ? `Try: muhkoo vfs use-app ${known[0]}`
-      : "Sign one in with: muhkoo vfs use-app <slug> --key <appKey>\n" +
-        "App keys are shown when an app is created (muhkoo apps create).")
-  );
+  return [
+    "Writing stores bytes, which are metered to an app — so a write needs one signed in.",
+    ...(known.length
+      ? [`Try: muhkoo vfs use-app ${known[0]}`]
+      : ["Sign one in with: muhkoo vfs use-app <slug> --key <appKey>", "App keys are shown when an app is created (muhkoo apps create)."]),
+  ];
 }

@@ -16,7 +16,7 @@ import { readFile, access } from "node:fs/promises";
 import { loadConfig, resolveBase, resolveToken } from "../lib/config.js";
 import { devCall, ensure } from "../lib/http.js";
 import { firstOf } from "../lib/args.js";
-import { step, ok, info, die, c } from "../lib/ui.js";
+import { step, ok, info, die, c, json } from "../lib/ui.js";
 
 export const help = `muhkoo promote — promote an app's TEST hosting to PRODUCTION
 
@@ -55,7 +55,7 @@ export default async function promote(args) {
 
   if (args.json) {
     info("");
-    console.log(JSON.stringify(r.body, null, 2));
+    json(r.body);
   } else {
     info("");
     ok("Promoted test → production.");

@@ -27,6 +27,9 @@ Usage:
   muhkoo vcs switch <name>               move onto a branch
   muhkoo vcs checkout <commit>           inspect an old state (detaches HEAD)
   muhkoo vcs merge <name>                bring a branch into this one
+  muhkoo vcs merge --abort               give up on a merge that stopped for
+                                        conflicts, or whose record cannot be
+                                        read (--discard: put the files back too)
   muhkoo vcs restore <path> [<commit>]   put one file back
 
 Options:
@@ -60,12 +63,23 @@ export default async function vcs(args) {
   switch (sub) {
     case "status": {
       const changes = await repo.status();
-      const branch = (await repo.currentBranch()) ?? `${c.dim("detached at")} ${short(await repo.current())}`;
-      const pending = await repo.pendingMerge();
-      if (args.json) return json({ project: slug, branch, changes, merging: pending?.name ?? null });
+      const name = await repo.currentBranch();
+      const detached = name ? null : short(await repo.current());
+      // Status is what people run to find out what is wrong, so a merge record
+      // that cannot be read is said, with the way out, not thrown.
+      const { pending, unreadable } = await readPending(repo);
+      if (args.json) {
+        return json({
+          project: slug, branch: name ?? `detached at ${detached}`, changes, merging: pending?.name ?? null,
+          ...(unreadable ? { mergeUnreadable: true } : {}),
+        });
+      }
 
-      info(`${c.bold(slug)} on ${branch}`);
+      info(`${c.bold(slug)} on ${name ?? `${c.dim("detached at")} ${detached}`}`);
       if (pending) warn(`Merging ${pending.name} — resolve the files below, then commit to finish it.`);
+      if (unreadable) {
+        warn("A merge is in progress, but its record cannot be read, so no commit can be made until it is cleared: `muhkoo vcs merge --abort`.");
+      }
       if (!changes.length) return info("Nothing has changed since the last commit.");
       return table(["", "PATH"], changes.map((ch) => [mark(ch.kind), ch.path]));
     }
@@ -73,7 +87,7 @@ export default async function vcs(args) {
     case "commit": {
       if (!message) return die("A commit needs a message: `muhkoo vcs commit -m \"what changed\"`");
       const hash = await repo.commit(String(message));
-      return ok(`${short(hash)}  ${message}`);
+      return ok(`${short(hash)}  ${subject(message)}`);
     }
 
     case "log": {
@@ -85,7 +99,7 @@ export default async function vcs(args) {
         entries.map((e) => [
           short(e.hash) + (e.parents.length > 1 ? c.dim(" (merge)") : ""),
           when(e.at),
-          e.message,
+          subject(e.message),
         ]),
       );
     }
@@ -148,6 +162,49 @@ export default async function vcs(args) {
     }
 
     case "merge": {
+      // The way out of a merge. Without it a CLI-only user was told to abort a
+      // merge with no command that does, and a pending-merge record that could
+      // not be read stopped every `vcs commit` for good.
+      if (args.abort) {
+        // `merge --abort feature` parses as abort: "feature", `merge --abort
+        // -m x` as abort: "-m" with x left over, and `--discard feature` as
+        // discard: "feature". Refuse whatever came with it, rather than guess
+        // what was meant.
+        const extra = [
+          ...["abort", "discard", "json"].filter((k) => typeof args[k] === "string").map((k) => args[k]),
+          ...args._.slice(2),
+          ...(message !== undefined ? ["-m", message] : []),
+          ...(count !== undefined ? ["-n", count] : []),
+        ];
+        if (extra.length) {
+          return die(
+            `\`vcs merge --abort\` takes nothing else, but was given: ${extra.join(" ")}`,
+            "  Run it on its own to give up on the merge, with --discard to put your files back too.",
+          );
+        }
+        const { pending, unreadable } = await readPending(repo);
+        if (!pending && !unreadable) return args.json ? json({ aborted: false, merge: null }) : info("No merge in progress.");
+        await repo.abortMerge();
+        const merged = pending?.name ?? null;
+        // Back as they were before the merge: the branch's tip — or, on a
+        // detached HEAD, the commit it is at, since switching to a branch would
+        // move HEAD somewhere else. HEAD that cannot be read has neither.
+        const branch = await repo.currentBranch().catch(() => null);
+        const head = branch ? null : await repo.current().catch(() => null);
+        const back = branch
+          ? { command: `muhkoo vcs switch ${branch} --discard`, run: () => repo.switchTo(branch, { discardChanges: true }) }
+          : head
+            ? { command: `muhkoo vcs checkout ${short(head)} --discard`, run: () => repo.checkout(head, { discardChanges: true }) }
+            : null;
+        if (args.discard && back) await back.run();
+        if (args.json) return json({ aborted: true, merge: merged });
+        return ok(
+          `Abandoned the merge${merged ? ` of ${merged}` : ""}. The next commit is an ordinary one.`,
+          args.discard && back
+            ? "  Your files are back as they were before the merge."
+            : `  Your files are as the merge left them; \`${back?.command ?? "muhkoo vcs switch <branch> --discard"}\` puts them back.`,
+        );
+      }
       const name = required(a(2), "merge <name>");
       const result = await repo.merge(name, { discardChanges: Boolean(args.discard) });
       if (result.kind === "up-to-date") return info(`Already up to date with ${name}.`);
@@ -210,6 +267,23 @@ async function parentOf(repo, hash) {
   }
 }
 
+/**
+ * The merge in progress, or null — with `unreadable` when connect cannot read
+ * its record, the case `merge --abort` exists for. Only that error is caught:
+ * a network failure, or no session, says nothing about the record, and
+ * clearing it on one would report a merge abandoned that may never have been.
+ */
+async function readPending(repo) {
+  try {
+    return { pending: await repo.pendingMerge(), unreadable: false };
+  } catch (err) {
+    if (err?.name === "VcsError" && /^the merge in progress cannot be read\b/.test(String(err.message))) {
+      return { pending: null, unreadable: true };
+    }
+    throw err;
+  }
+}
+
 function required(value, usage) {
   if (value === undefined) die(`Usage: muhkoo vcs ${usage}`);
   return value;
@@ -218,6 +292,15 @@ function required(value, usage) {
 /** Commit hashes are long; the first 8 characters identify one in practice. */
 function short(hash) {
   return hash ? String(hash).slice(0, 8) : "-";
+}
+
+/**
+ * A commit message's first line, as `git log --oneline` shows it. Every
+ * newline in a table cell is printed as a visible escape, so a body read as
+ * `fix\u000a\u000alonger body`; the whole message is in `vcs log --json`.
+ */
+function subject(message) {
+  return String(message ?? "").split(/\r?\n/)[0];
 }
 
 function mark(kind) {

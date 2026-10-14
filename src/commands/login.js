@@ -57,7 +57,8 @@ export default async function login(args) {
   ok(`Signed in${username ? ` as ${c.bold(username)}` : ""} → ${baseUrl}`);
   if (me.ok && me.body?.needsBootstrap) {
     info(
-      `\n${c.yellow("Note:")} your developer account isn't set up yet. Run ` +
+      "",
+      `${c.yellow("Note:")} your developer account isn't set up yet. Run ` +
         `\`muhkoo apps create --slug <name> --email you@example.com\` to bootstrap it.`,
     );
   } else if (me.ok && me.body?.tier) {

@@ -124,7 +124,7 @@ export async function webLogin({ baseUrl, appId }) {
 
   step("Opening your browser to sign in…");
   const opened = openBrowser(authUrl);
-  info(`${opened ? "If it didn't open, visit:" : "Open this URL to sign in:"}\n  ${c.cyan(authUrl)}\n`);
+  info(`${opened ? "If it didn't open, visit:" : "Open this URL to sign in:"}`, `  ${c.cyan(authUrl)}`, "");
 
   let code;
   try {

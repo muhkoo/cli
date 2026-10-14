@@ -55,7 +55,7 @@ async function add(ctx, appId, args) {
   ok(`Attached ${c.bold(hostname)}.`);
   const records = r.body?.records || r.body?.dnsRecords || [];
   if (records.length) {
-    info("\nAdd these DNS records at your registrar:");
+    info("", "Add these DNS records at your registrar:");
     table(
       ["TYPE", "NAME", "VALUE"],
       records.map((d) => [d.type, d.name, d.value]),

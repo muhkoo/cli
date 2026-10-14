@@ -38,9 +38,9 @@ export async function loadClient() {
     return mod.Client;
   } catch (e) {
     die(
-      "Couldn't load @muhkoo/connect for programmatic login.\n" +
-        "  Reinstall the CLI, or sign in via the portal and pass --token instead.\n" +
-        `  Underlying error: ${e?.message || e}`,
+      "Couldn't load @muhkoo/connect for programmatic login.",
+      "  Reinstall the CLI, or sign in via the portal and pass --token instead.",
+      `  Underlying error: ${e?.message || e}`,
     );
   }
 }

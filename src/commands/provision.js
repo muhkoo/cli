@@ -53,7 +53,7 @@ export default async function provision(args) {
   const spec = await readJson(args.spec);
   const prior = (await fileExists(OUT)) ? await readJson(OUT) : null;
   const ctx = await devContext(args);
-  info(`API base: ${ctx.baseUrl}${DRY ? "   (dry run)" : ""}\n`);
+  info(`API base: ${ctx.baseUrl}${DRY ? "   (dry run)" : ""}`, "");
 
   if (args.enable) {
     if (!prior?.appId) die(`--enable needs a prior ${OUT} from a provisioning run.`);
@@ -91,7 +91,7 @@ export default async function provision(args) {
   info(`  tables:  ${tables.join(", ") || "(none)"}`);
   info(`  hosting: ${hostingUrl}  (run \`muhkoo deploy\` once your client is built)`);
   if ((agents || []).some((a) => a.enableChannel) || (functions || []).some((f) => f.enableChannel)) {
-    info("\nNext: run the app once so its channels exist, then:");
+    info("", "Next: run the app once so its channels exist, then:");
     info(`  muhkoo provision --spec ${args.spec} --enable`);
   }
 }

@@ -96,7 +96,7 @@ async function create(ctx, appId, args) {
   ok(`Created ${t.env} access token${t.label ? ` ${c.bold(t.label)}` : ""} (${t.keyId})`);
   info(`  scopes:  ${(t.scopes || scopes).join(", ")}`);
   if (t.expiresAt) info(`  expires: ${fmtDate(t.expiresAt)}`);
-  info(`\n  ${c.bold(t.plaintext)}`);
+  info("", `  ${c.bold(t.plaintext)}`);
   warn("Save this token now — it is shown only once.");
 }
 

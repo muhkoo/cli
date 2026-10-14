@@ -8,7 +8,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { parseArgs } from "./lib/args.js";
-import { c, die } from "./lib/ui.js";
+import { c, die, info } from "./lib/ui.js";
 
 const COMMANDS = {
   login: () => import("./commands/login.js"),
@@ -22,6 +22,7 @@ const COMMANDS = {
   promote: () => import("./commands/promote.js"),
   vfs: () => import("./commands/vfs.js"),
   vcs: () => import("./commands/vcs.js"),
+  kv: () => import("./commands/kv.js"),
   devices: () => import("./commands/devices.js"),
   hosting: () => import("./commands/hosting.js"),
   domains: () => import("./commands/domains.js"),
@@ -55,9 +56,15 @@ Backend
   functions ls|get|code|deploy|rm|enable|disable
 
 Files
-  vfs ls|cat|put|get|rm|cp|mv|find|history|restore
-  vcs status|commit|log|diff|branch|switch|merge
+  vfs cd|pwd|ls|stat|tree|cat|put|get|mkdir|rm|cp|mv|find|history|restore
                          your encrypted filesystem
+  vfs import|mount|ignore
+                         upload a project, keep a directory in sync, and
+                         choose what syncs
+  vfs sweep|use-app|app  reclaim records; pick the app writes are made as
+  vcs status|commit|log|show|diff|branch|switch|checkout|merge|restore
+                         version control over it
+  kv ls [prefix]         keys in your personal key/value store
 
 Hosting
   deploy                 deploy a built client to Muhkoo hosting (test env)
@@ -91,8 +98,8 @@ export async function run(argv) {
   const args = parseArgs(argv.map((a) => (a === "-h" ? "--help" : a === "-v" ? "--version" : a)));
   const name = args._[0];
 
-  if (wantsVersion) return console.log(await version());
-  if (!name || name === "help") return console.log(TOP_HELP);
+  if (wantsVersion) return info(await version());
+  if (!name || name === "help") return info(...TOP_HELP.split("\n"));
 
   const loader = COMMANDS[name];
   if (!loader) {
@@ -104,7 +111,7 @@ export async function run(argv) {
   // Per-command help.
   if (wantsHelp) {
     // `keys` reuses apps.js, which documents `keys rotate` in its own help.
-    console.log(mod.help || TOP_HELP);
+    info(...(mod.help || TOP_HELP).split("\n"));
     return;
   }
 

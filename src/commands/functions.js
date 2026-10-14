@@ -7,7 +7,7 @@ import { readFile } from "node:fs/promises";
 import { devContext } from "../lib/config.js";
 import { devCall, ensure } from "../lib/http.js";
 import { resolveSpace } from "../lib/spaces.js";
-import { table, json, ok, info, die } from "../lib/ui.js";
+import { table, json, ok, info, die, writeText } from "../lib/ui.js";
 
 export const help = `muhkoo functions — manage serverless functions
 
@@ -70,7 +70,7 @@ async function code(ctx, appId, args) {
   const id = args._[3];
   if (!id) die("Usage: muhkoo functions code <appId> <functionId>");
   const r = ensure(await devCall(ctx, "GET", `/api/apps/${appId}/functions/${id}/code`), "Read function code");
-  process.stdout.write((r.body?.code ?? "") + "\n");
+  writeText((r.body?.code ?? "") + "\n");
 }
 
 async function deployOne(ctx, appId, args) {

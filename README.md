@@ -14,9 +14,8 @@ npm install -g @muhkoo/cli@alpha
 npx @muhkoo/cli@alpha --help
 ```
 
-Ask for the **`alpha`** tag explicitly. `latest` still points at the older
-`0.13.2-alpha.0` line, so a bare install gets a CLI without the commands
-documented here.
+The **`alpha`** and **`latest`** tags both point at the newest alpha, and the
+CLI is released in lockstep with `@muhkoo/connect`.
 
 Requires Node.js 20+.
 
@@ -85,7 +84,9 @@ muhkoo devices rm <factorId>   # withdraw access — takes effect immediately
 Revoking the machine you are on also clears its now-useless local key, so the
 next filesystem command pairs again from scratch rather than retrying a pairing
 the server has forgotten. `MUHKOO_SEED` bypasses pairing entirely, for CI, where
-there is no interactive login to pair with.
+there is no interactive login to pair with. `--no-pair` signs in for one command
+and stores nothing. (In 0.14.0-alpha.8 the flag was ignored, and the machine
+was paired anyway.)
 
 ## Environments
 
@@ -105,7 +106,10 @@ muhkoo whoami  --base https://api.example.com
 Account     login · logout · devices ls|rm · whoami
 Apps        apps ls|get|create|slug|rm · keys rotate · tokens ls|create|revoke
 Backend     provision · tables · agents · functions
-Files       vfs ls|cat|put|get|rm|cp|mv|find|history|restore · vcs status|commit|log|diff|branch|switch|merge
+Files       vfs cd|pwd|ls|stat|tree|cat|put|get|mkdir|rm|cp|mv|find|history|restore
+            vfs import|mount|ignore · vfs sweep|use-app|app
+            vcs status|commit|log|show|diff|branch|switch|checkout|merge|restore · vcs merge --abort
+            kv ls [prefix]
 Hosting     deploy · promote · hosting status|rollback|rm-release|unpublish · domains
 Tools       logs · eject
 ```
@@ -124,6 +128,104 @@ muhkoo domains add <appId> app.example.com      # attach a custom domain
 muhkoo agents enable <appId> <agentId> --channel general
 muhkoo eject src/agent/agentApp.ts              # preview an agent's prompt + tools
 ```
+
+## Syncing a directory
+
+This section describes 0.14.0-alpha.9. In 0.14.0-alpha.8,
+`vfs ignore [dir] [--write]` only drafts a `.vcsignore`, with no `--accept` or
+`--draft`, and `import` runs the full two-way sync: it writes remote files
+into the project, and with `--allow-delete` it deletes local files too.
+
+```bash
+muhkoo vfs import ./my-app --dry-run            # what would upload, and what import skips
+muhkoo vfs import ./my-app                      # upload once, to /apps/<slug>
+muhkoo vfs mount ./my-app --path /apps/my-app --dry-run   # what mounting would do
+muhkoo vfs mount ./my-app --path /apps/my-app   # two-way sync, live until Ctrl-C
+muhkoo vfs ignore ./my-app                      # what earlier ignore rules still hold back
+muhkoo vfs ignore ./my-app --accept             # preview an accept, and its digest
+muhkoo vfs ignore ./my-app --accept <digest>    # accept exactly the files you previewed
+```
+
+`import` uploads whole projects once, then stops. It only uploads: it never
+writes or deletes anything on this disk. Each directory goes to `/apps/<slug>`,
+where `<slug>` comes from its `.muhkoo-app.json`, or failing that its own name.
+If any directory fails, the rest are still tried and the command exits 1.
+`--dry-run` works for both. For `import` it lists what would upload; for `mount`
+it lists what mounting would download, upload and delete, then stops without
+syncing or watching. Neither writes anything, not even for a moment: not in the
+directory, not under `~/.muhkoo`, and not in your filesystem. A dry run does not
+pair this machine either; if it is not paired yet, you sign in for that one
+command. (In 0.14.0-alpha.8, `mount` ignored `--dry-run` and mounted for real.)
+
+`mount` keeps one directory in sync with your filesystem until you stop it.
+`--path` defaults to `/`, your whole filesystem, so pass the subtree you mean.
+Ctrl-C, SIGTERM or closing the terminal stops it after the current file and
+saves its state. A second Ctrl-C quits at once (exit code 130), which is safe
+because every file lands by renaming a temp file into place.
+
+What syncs is decided by a root `.vcsignore` if there is one. Otherwise git's
+rules apply in full: every `.gitignore`, each scoped to its own directory, and
+`.git/info/exclude`. Built-in Node defaults sit underneath either way (build
+output, logs, `.env` and `.env.*`, but not `.env.example`). Dot-files, other
+than `.vcsignore` and `.gitignore` files, are skipped unless you pass
+`--hidden`. `muhkoo vfs ignore <dir> --draft` prints a `.vcsignore` drafted
+from all of them.
+
+### What mount and import protect against
+
+Every app you sign into holds your master seed, so any of them can write your
+filesystem, and so choose the paths, names and bytes that `mount` brings down.
+Everything read from your filesystem is therefore treated as untrusted input,
+and it cannot reach this disk except through these checks:
+
+- **Some paths never sync, in either direction.** No flag and no ignore rule
+  changes that: `.git`, `.ssh`, `.muhkoo`, `node_modules`, `.husky`, editor and
+  agent directories (`.vscode`, `.idea`, `.config`, `.claude`, `.cursor`,
+  `.zed`, `.fleet`), and credential and shell start-up files (`.envrc`,
+  `.npmrc`, `.netrc`, `.gitconfig`, `.profile`, `.bashrc`, `.zshrc`, `.zshenv`
+  and the rest). Each one either holds credentials or can run code without an
+  execute bit. Names are compared the way a case-folding volume would compare
+  them, so `Node_Modules`, `.GIT` and `GIT~1` are refused too.
+- **Never your home directory.** Both commands refuse the filesystem root, your
+  home directory, and anything that contains it. There is no override.
+- **One write boundary.** Every write and delete on disk checks each part of
+  the path: no symlinks, no alternative spellings, and no replacing a local
+  file that is not synced. A new file never gets an execute bit.
+- **An edit to an ignore file cannot widen what syncs.** A new exclusion
+  applies at once. A loosening, whether you made it or it arrived from your
+  filesystem, waits until `muhkoo vfs ignore <dir> --accept <digest>` accepts
+  exactly the files you previewed. Each change to the rules since the last
+  accept is kept as another set, up to 64 sets or 2 MB. Past that, or if the
+  stored rules cannot be read, nothing syncs until you accept.
+- **Deletes are off by default, in both directions.** A delete removes the
+  file's history too, so unlike an overwrite it cannot be undone.
+  `--allow-delete` trusts the remote side. A pass that would delete more than 3
+  files and leave fewer than half of those it has tracked, or delete anything
+  when the other side is empty, deletes nothing in that direction and says why.
+  That guard catches a missing or renamed root, not whatever can write your
+  filesystem.
+- **Each pass is bounded.** Files over 100 MB are skipped. One pass of `mount`
+  pulls at most 2 GiB or 10,000 files and reads at most as much to compare. A
+  pull waits when it would leave less than 5% of the disk free (at least 1 GiB,
+  at most 10 GiB). A size your filesystem reports can only get a file skipped
+  or held sooner: the size limit, the pull budget and the reserve are checked
+  again against the bytes that arrive.
+- **Remote text is escaped** before it reaches your terminal, so a planted
+  file name or commit message cannot send control sequences.
+
+What this does not cover: ordinary project files, such as source, scripts,
+`bin/` and package-manager configs, still sync in both directions, so an app
+holding your seed can change code that you later run. Anything you upload can
+be read by every app you sign into. The root cause, apps being handed your
+master seed at sign-in, is not fixed yet.
+
+If you used `--hidden` with 0.14.0-alpha.8 or earlier, it may have uploaded
+`.git/`, `.npmrc`, `.netrc` and similar files, and `.env` files if an ignore
+file negated the default `.env` rules. Check with `muhkoo vfs tree`, remove
+them with `muhkoo vfs rm -r`, and rotate any token they held. Before the first
+run, also look over your ignore files, nested ones included, for lines you did
+not write: this version takes whatever is on disk the first time it runs as
+your own rules. The [CHANGELOG](./CHANGELOG.md) has the details.
 
 ## The provision spec
 
