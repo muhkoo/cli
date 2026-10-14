@@ -77,12 +77,40 @@ const KEEP_HIDDEN = new Set([".vcsignore", ".gitignore"]);
 const MAX_BYTES = 100 * 1024 * 1024;
 
 /**
- * How many files to read at once.
+ * How many files the scan reads at once.
  *
  * Enough to hide per-request latency; low enough not to open a connection per
- * file on a large project.
+ * file on a large project. A read costs 0.3–0.5 s against production, nearly
+ * all of it fixed, so throughput comes from overlapping them: 96 small files
+ * took 6.35 s eight at a time, 4.50 s at sixteen, and 4.12 s at thirty-two.
  */
-const READ_CONCURRENCY = 8;
+export const SCAN_CONCURRENCY = 16;
+
+/**
+ * And the most the files being read may claim between them — by their
+ * records' sizes, and their manifests' — before another read waits for one
+ * to finish. So raising the count does not raise the memory a run of large
+ * files holds at once. A file that claims more than this on its own is read
+ * alone: nothing else starts until it is done.
+ */
+export const SCAN_WINDOW_BYTES = 64 * 1024 * 1024;
+
+/**
+ * How many pulls to fetch at once while the oldest lands (see `applyPlan`).
+ *
+ * A pull the scan did not keep the bytes of — past BLOB_CACHE_BYTES, or a
+ * follow-up pass — is a round trip of its own, and one at a time they cost
+ * the SUM of the latencies. Only the fetches overlap; every pull still lands
+ * one at a time, in plan order.
+ */
+const PULL_CONCURRENCY = 8;
+
+/**
+ * And the most the records of the pulls being fetched may claim between
+ * them before the window waits for one to land — so a run of large files is
+ * not held in memory eight at a time. One is always let through.
+ */
+const PULL_WINDOW_BYTES = 64 * 1024 * 1024;
 
 /**
  * The most one pass pulls: bytes and files. Past it, the rest wait for a
@@ -1110,12 +1138,18 @@ export async function scanRemote(vfs, root, includeHidden = false, ignore = () =
     const readPace = pacer();   // reads from a cache resolve at once, and never yield on their own
     const seen = new Map();      // content key → { hash, size }, for the next pass
     const reading = new Map();   // content key → the read under way
+    const oversize = new Map();  // content key → its length, for a read that came back over MAX_BYTES
     const blobs = ctx.blobs ?? blobCache(BLOB_CACHE_BYTES);
     const budget = sess.readBudget;
     const spent = ctx.spent ?? { bytes: 0, files: 0 };
     const deferred = new Set();
+    // Bytes in flight are bounded as well as reads (SCAN_WINDOW_BYTES), by the
+    // same claim the budget is charged. A read waiting for room is not
+    // started once the scan is stopped.
+    const window = byteWindow(SCAN_WINDOW_BYTES);
+    const STOPPED = Symbol("stopped");
     await Promise.all(
-        Array.from({ length: Math.min(READ_CONCURRENCY, queue.length) }, async () => {
+        Array.from({ length: Math.min(SCAN_CONCURRENCY, queue.length) }, async () => {
             for (let item = queue.shift(); item !== undefined && !ctx.signal?.aborted; item = queue.shift()) {
                 const breather = readPace();
                 if (breather) await breather;
@@ -1140,6 +1174,12 @@ export async function scanRemote(vfs, root, includeHidden = false, ignore = () =
                         sizes[key] = known.size;
                         continue;
                     }
+                    const over = content.key && oversize.get(content.key);
+                    if (over) {
+                        tooBig(sess, key, over);
+                        unknown.add(key);
+                        continue;
+                    }
                     let read = content.key && reading.get(content.key);
                     if (!read) {
                         // Ignore files included: a 256 KB file of comments is
@@ -1154,16 +1194,37 @@ export async function scanRemote(vfs, root, includeHidden = false, ignore = () =
                             spent.files++;
                             spent.bytes += claim;
                         }
-                        read = content.read().then((bytes) => {
-                            spent.bytes += bytes.length - claim;
-                            return bytes;
-                        });
+                        read = (async () => {
+                            const admitted = await window.acquire(claim, ctx.signal);
+                            if (admitted && ctx.signal?.aborted) window.release(claim);   // let in, but stopped since
+                            if (!admitted || ctx.signal?.aborted) {
+                                if (budget) {   // never read: give back what it was charged
+                                    spent.files--;
+                                    spent.bytes -= claim;
+                                }
+                                throw STOPPED;
+                            }
+                            try {
+                                const bytes = await content.read();
+                                spent.bytes += bytes.length - claim;
+                                return bytes;
+                            } finally {
+                                window.release(claim);
+                            }
+                        })();
                         if (content.key) reading.set(content.key, read);
                     }
                     const bytes = await read;
                     if (bytes.length > MAX_BYTES) {
                         tooBig(sess, key, bytes.length);
                         unknown.add(key);
+                        if (content.key) {
+                            // Only its length is kept: entries sharing this
+                            // content get the same answer without the read
+                            // (up to 100 MB) staying referenced.
+                            oversize.set(content.key, bytes.length);
+                            reading.delete(content.key);
+                        }
                         continue;
                     }
                     const hash = sha(bytes);
@@ -1172,8 +1233,18 @@ export async function scanRemote(vfs, root, includeHidden = false, ignore = () =
                     if (content.key) {
                         seen.set(content.key, { hash, size: bytes.length });
                         blobs.put(content.key, bytes);
+                        // `seen` answers for this content from here on. Left
+                        // in `reading`, the settled read held every byte the
+                        // pass read, past the blob cache's limit and the window.
+                        reading.delete(content.key);
                     }
                 } catch (err) {
+                    // Stopped before its read began: not read, and nothing to
+                    // warn of. The caller does not plan from a stopped scan.
+                    if (err === STOPPED) {
+                        unknown.add(key);
+                        continue;
+                    }
                     // One unreadable entry — a lost shard, a planted manifest, a
                     // dropped request — must not stop the whole sync, and must
                     // not read as a deletion either.
@@ -1213,10 +1284,11 @@ export async function scanRemote(vfs, root, includeHidden = false, ignore = () =
  */
 async function remoteContent(vfs, abs) {
     if (typeof vfs.statManifest !== "function") {
-        const { size } = await vfs.stat(abs);
+        const size = recordSize((await vfs.stat(abs)).size);
         return { size, key: null, bound: null, read: () => vfs.readFile(abs) };
     }
-    const { manifest, size } = await vfs.statManifest(abs);
+    const { manifest, size: claimed } = await vfs.statManifest(abs);
+    const size = recordSize(claimed);
     const exact = typeof vfs.readByManifest === "function";
     return {
         size,
@@ -1224,6 +1296,15 @@ async function remoteContent(vfs, abs) {
         bound: manifestBound(manifest),
         read: exact ? () => vfs.readByManifest(manifest) : () => vfs.readFile(abs),
     };
+}
+
+/**
+ * A record's size, as a number the budgets can add. The record is written by
+ * the remote party, so the size may be absent, a string, negative or NaN; any
+ * of those counts as 0 (the bytes that come back are what is held to the limit).
+ */
+function recordSize(size) {
+    return Number.isSafeInteger(size) && size >= 0 ? size : 0;
 }
 
 /**
@@ -1244,6 +1325,63 @@ function manifestBound(manifest) {
         fetched += shardHashes.length * shardSize;
     }
     return { plain, fetched };
+}
+
+/**
+ * A first-come, first-served allowance of `limit` bytes for reads in flight.
+ *
+ * `acquire(n, signal)` resolves true once `n` more bytes fit — or at once
+ * when nothing is held, so one claim larger than the whole window is still
+ * let through, alone — and false, without taking anything, when `signal`
+ * has fired. Waiters are served in order, so a large claim is not starved by
+ * small ones arriving behind it. `release(n)` gives back what an acquire took.
+ */
+function byteWindow(limit) {
+    let held = 0;
+    // A claim that is not a finite, non-negative number is 0: NaN in `held`
+    // would make nothing fit again, and the scan would never finish.
+    const sane = (n) => (Number.isFinite(n) && n > 0 ? n : 0);
+    const waiting = [];
+    const fits = (n) => held === 0 || held + n <= limit;
+    const wake = () => {
+        while (waiting.length && fits(waiting[0].n)) {
+            const w = waiting.shift();
+            held += w.n;
+            w.done(true);
+        }
+    };
+    return {
+        acquire(claim, signal) {
+            const n = sane(claim);
+            if (signal?.aborted) return Promise.resolve(false);
+            if (!waiting.length && fits(n)) {
+                held += n;
+                return Promise.resolve(true);
+            }
+            return new Promise((resolve) => {
+                const onAbort = () => {
+                    const i = waiting.indexOf(w);
+                    if (i < 0) return;
+                    waiting.splice(i, 1);
+                    resolve(false);
+                    wake();   // the head may have been what held the rest
+                };
+                const w = {
+                    n,
+                    done: (ok) => {
+                        signal?.removeEventListener("abort", onAbort);
+                        resolve(ok);
+                    },
+                };
+                waiting.push(w);
+                signal?.addEventListener("abort", onAbort, { once: true });
+            });
+        },
+        release(claim) {
+            held -= sane(claim);
+            wake();
+        },
+    };
 }
 
 /**
@@ -1617,10 +1755,22 @@ function breakerMessage({ action, count, tracked, empty }, dir, root) {
 /**
  * Apply a plan, and return the new last-synced view.
  *
- * Applied sequentially rather than in parallel: writes touch one directory
- * record each, and two concurrent writes to the same record would have one
- * silently lose ([[VfsNamespace]] consistency note). `signal` stops it between
- * steps — never inside one — and what was done by then is what it returns.
+ * Every step that changes something — a write to the filesystem, a delete, a
+ * file landing on this disk — is made one at a time, in plan order: writes
+ * touch one directory record each, and two concurrent writes to the same
+ * record would have one silently lose ([[VfsNamespace]] consistency note).
+ * Pushes, deletes and conflicts are applied exactly as before, in sequence.
+ *
+ * Only the FETCH of a pull overlaps: up to PULL_CONCURRENCY pulls, in plan
+ * order, are fetched while the oldest lands. A pull reads nothing but the
+ * network and the pass's blob cache, so overlapping them changes no state;
+ * landing stays in plan order, on the same checks, so what lands — and which
+ * of two spellings a folding volume refuses — is what a sequential pass would
+ * land. A step that is not a pull first lands every pull before it.
+ *
+ * `signal` stops it between steps — never inside one — and what was done by
+ * then is what it returns. Pulls fetched but not yet landed when it fires are
+ * dropped, unrecorded, and the next pass plans them again.
  *
  * A step this disk declines (a pull onto a symlink, a remote file where a
  * directory stands) is warned about once and left out of the result, so the
@@ -1635,8 +1785,138 @@ async function applyPlan({ vfs, dir, root, state, plan, pass, opts, sess, signal
     const listing = new Map();
     const localKeys = new Set(Object.keys(pass.local));
     const decline = (action, path, reason) => warnOnce(sess, `declined:${action}:${path}`, `skipping ${path} — ${reason}`);
+    const failed = (action, path, err) => {
+        const message = err?.message ?? String(err);
+        warnOnce(sess, `error:${path}:${message}`, `${path}: ${message}`);
+        if (action === "pull" && isIgnoreFile(path.slice(1))) pass.notLanded?.set(path, message);
+    };
     let short = 0;   // pulls held for want of disk space
     let over = 0;    // and past the pass's budget
+
+    // ---- pulls: admitted and fetched ahead, landed in order ----
+    //
+    // Held pulls change nothing, so the next pass plans them again. Each limit
+    // is checked twice: on the size the scan read, so a pull that cannot fit is
+    // not fetched at all, and then on the bytes actually fetched — the file may
+    // have changed since, and they are what land on this disk.
+    //
+    // A pull is RESERVED against both limits when it is admitted, before it is
+    // fetched: `inFlight` is what has been admitted and not yet landed. Without
+    // it, pulls checked together, before any had landed, would each see the
+    // same free space and the same budget, and together overshoot both.
+    //
+    // Ignore files are held to the same limits. They were exempt as "small",
+    // and a 256 KB file of comments, copied to thousands of directories, put
+    // 7 GiB on a disk already under its reserve in one pass. One held here
+    // holds this pass's uploads instead (see `reconcile`).
+    const limit = sess.pullBudget;
+    const inFlight = { files: 0, bytes: 0 };
+    const window = [];               // pulls being fetched, in plan order
+    const fetching = new Map();      // content key → its fetch, so two entries sharing it fetch it once
+    /**
+     * Why a pull of `size` more bytes must wait, or null. `admitted`: the pull
+     * was let in already, so a budget that has filled behind it — with pulls
+     * admitted after it, which it lands ahead of — does not stop it; only its
+     * own bytes, with what is still in flight, going over does.
+     */
+    const holdFor = async (size, admitted = false) => {
+        const files = budget.files + inFlight.files;
+        if ((budget.full && !admitted) || (files && (files + 1 > limit.files || budget.bytes + inFlight.bytes + size > limit.bytes))) {
+            budget.full = true;
+            over++;
+            return "this pass has pulled all it may; the next pass carries on";
+        }
+        if (await roomFor(dir, inFlight.bytes + size, sess)) return null;
+        short++;
+        return "the disk would be left with less than its reserve free";
+    };
+    /** The bytes of `remoteAbs`. Content the scan read — or an earlier pull, of an entry sharing it — is not fetched again. */
+    const fetchBytes = async (remoteAbs) => {
+        const content = await remoteContent(vfs, remoteAbs);
+        const kept = pass.blobs?.get(content.key);
+        if (kept) return kept;
+        let read = content.key ? fetching.get(content.key) : undefined;
+        if (!read) {
+            read = content.read();
+            if (content.key) {
+                fetching.set(content.key, read);
+                read.then(() => fetching.delete(content.key), () => fetching.delete(content.key));
+            }
+        }
+        const bytes = await read;
+        pass.blobs?.put(content.key, bytes);
+        return bytes;
+    };
+    /** Admit a pull and start fetching it; null when it is held or declined here. */
+    const startPull = async (path, remoteAbs) => {
+        const claim = pass.sizes?.[path] ?? 0;
+        const hold = await holdFor(claim);
+        if (hold) {
+            pass.notLanded?.set(path, hold);
+            return null;
+        }
+        // A target this disk refuses is not fetched at all. Checked again when
+        // it lands: the pulls landing ahead of it may have changed the answer.
+        const target = await writeTarget(dir, path, { localKeys, listing });
+        if (!target.ok) {
+            decline("pull", path, target.reason);
+            pass.notLanded?.set(path, target.reason);
+            return null;
+        }
+        inFlight.files++;
+        inFlight.bytes += claim;
+        const bytes = fetchBytes(remoteAbs);
+        bytes.catch(() => {});   // its failure is reported when it lands
+        return { path, remoteAbs, claim, bytes };
+    };
+    /** Land a fetched pull: the same checks a sequential pass made, then the write. */
+    const land = async ({ path, remoteAbs, claim, bytes: fetched }) => {
+        inFlight.files--;
+        inFlight.bytes -= claim;
+        const bytes = await fetched;
+        if (bytes.length > MAX_BYTES) {
+            tooBig(sess, path, bytes.length);
+            pass.notLanded?.set(path, "it is over the mount's size limit");
+            return;
+        }
+        const hold = await holdFor(bytes.length, true);
+        if (hold) {
+            pass.notLanded?.set(path, hold);
+            return;
+        }
+        // An ignore file that cannot be read as rules is not pulled: landed, it
+        // would stop every pass (see `see`), and uploads wait for it instead
+        // (see `reconcile`).
+        const rules = isIgnoreFile(path.slice(1));
+        const problem = rules && ignoreFileProblem(bytes);
+        if (problem) {
+            decline("pull", path, `it cannot be read as ignore rules: ${problem}. If it is not yours, remove it: muhkoo vfs rm ${remoteAbs}`);
+            pass.notLanded?.set(path, `it cannot be read as ignore rules: ${problem}`);
+            return;
+        }
+        const target = await writeTarget(dir, path, { localKeys, listing });
+        if (!target.ok) {
+            decline("pull", path, target.reason);
+            pass.notLanded?.set(path, target.reason);
+            return;
+        }
+        await writeAt(target, bytes, listing);
+        next[path] = sha(bytes);
+        if (rules) pass.landed?.add(path);
+        budget.files++;
+        budget.bytes += bytes.length;
+        info(`${SIGN.pull} ${path}`);
+    };
+    const landOldest = async () => {
+        const pull = window.shift();
+        try {
+            await land(pull);
+        } catch (err) {
+            failed("pull", pull.path, err);
+        }
+    };
+    /** Room for another pull in the window? Bounded in files, and — by what the records claim — in bytes held. */
+    const windowFull = () => window.length >= PULL_CONCURRENCY || (window.length > 0 && inFlight.bytes >= PULL_WINDOW_BYTES);
 
     for (const { path, action } of plan) {
         if (signal?.aborted) break;
@@ -1649,6 +1929,21 @@ async function applyPlan({ vfs, dir, root, state, plan, pass, opts, sess, signal
             continue;
         }
         const remoteAbs = root === "/" ? path : root + path;
+        if (action === "pull") {
+            while (windowFull() && !signal?.aborted) await landOldest();
+            if (signal?.aborted) break;
+            try {
+                const pull = await startPull(path, remoteAbs);
+                if (pull) window.push(pull);
+            } catch (err) {
+                failed(action, path, err);
+            }
+            continue;
+        }
+        // Anything else waits for the pulls before it, so steps still take
+        // effect in plan order.
+        while (window.length && !signal?.aborted) await landOldest();
+        if (signal?.aborted) break;
         try {
             switch (action) {
                 case "push": {
@@ -1656,77 +1951,6 @@ async function applyPlan({ vfs, dir, root, state, plan, pass, opts, sess, signal
                     await vfs.writeFile(remoteAbs, new Uint8Array(bytes));
                     next[path] = sha(bytes);
                     info(`${SIGN.push} ${path}`);
-                    break;
-                }
-                case "pull": {
-                    // Held pulls change nothing, so the next pass plans them
-                    // again. Each limit is checked twice: on the size the scan
-                    // read, so a pull that cannot fit is not fetched at all, and
-                    // then on the bytes actually fetched — the file may have
-                    // changed since, and they are what land on this disk.
-                    //
-                    // Ignore files are held to the same limits. They were
-                    // exempt as "small", and a 256 KB file of comments, copied
-                    // to thousands of directories, put 7 GiB on a disk already
-                    // under its reserve in one pass. One held here holds this
-                    // pass's uploads instead (see `reconcile`).
-                    const limit = sess.pullBudget;
-                    /** Why a pull of `size` bytes must wait, or null. */
-                    const holdFor = async (size) => {
-                        if (budget.full || (budget.files && (budget.files + 1 > limit.files || budget.bytes + size > limit.bytes))) {
-                            budget.full = true;
-                            over++;
-                            return "this pass has pulled all it may; the next pass carries on";
-                        }
-                        if (await roomFor(dir, size, sess)) return null;
-                        short++;
-                        return "the disk would be left with less than its reserve free";
-                    };
-                    let hold = await holdFor(pass.sizes?.[path] ?? 0);
-                    if (hold) {
-                        pass.notLanded?.set(path, hold);
-                        break;
-                    }
-                    const target = await writeTarget(dir, path, { localKeys, listing });
-                    if (!target.ok) {
-                        decline(action, path, target.reason);
-                        pass.notLanded?.set(path, target.reason);
-                        break;
-                    }
-                    // Content the scan read — or an earlier pull, of an entry
-                    // sharing it — is not fetched again.
-                    const content = await remoteContent(vfs, remoteAbs);
-                    let bytes = pass.blobs?.get(content.key);
-                    if (!bytes) {
-                        bytes = await content.read();
-                        pass.blobs?.put(content.key, bytes);
-                    }
-                    if (bytes.length > MAX_BYTES) {
-                        tooBig(sess, path, bytes.length);
-                        pass.notLanded?.set(path, "it is over the mount's size limit");
-                        break;
-                    }
-                    hold = await holdFor(bytes.length);
-                    if (hold) {
-                        pass.notLanded?.set(path, hold);
-                        break;
-                    }
-                    // An ignore file that cannot be read as rules is not
-                    // pulled: landed, it would stop every pass (see `see`), and
-                    // uploads wait for it instead (see `reconcile`).
-                    const rules = isIgnoreFile(path.slice(1));
-                    const problem = rules && ignoreFileProblem(bytes);
-                    if (problem) {
-                        decline(action, path, `it cannot be read as ignore rules: ${problem}. If it is not yours, remove it: muhkoo vfs rm ${remoteAbs}`);
-                        pass.notLanded?.set(path, `it cannot be read as ignore rules: ${problem}`);
-                        break;
-                    }
-                    await writeAt(target, bytes, listing);
-                    next[path] = sha(bytes);
-                    if (rules) pass.landed?.add(path);
-                    budget.files++;
-                    budget.bytes += bytes.length;
-                    info(`${SIGN.pull} ${path}`);
                     break;
                 }
                 case "delete-remote":
@@ -1795,10 +2019,16 @@ async function applyPlan({ vfs, dir, root, state, plan, pass, opts, sess, signal
                 }
             }
         } catch (err) {
-            const message = err?.message ?? String(err);
-            warnOnce(sess, `error:${path}:${message}`, `${path}: ${message}`);
-            if (action === "pull" && isIgnoreFile(path.slice(1))) pass.notLanded?.set(path, message);
+            failed(action, path, err);
         }
+    }
+    // Land what is still fetching — or, stopped, drop it: a fetch is not a
+    // step, and nothing is recorded for a pull that did not land. Its fetch is
+    // still waited for, so none runs on after the pass has returned.
+    while (window.length && !signal?.aborted) await landOldest();
+    if (window.length) {
+        await Promise.allSettled(window.map((p) => p.bytes));
+        window.length = 0;
     }
     if (budget.full) {
         sess.more = true;

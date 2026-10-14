@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { VfsNamespace } from "@muhkoo/connect";
-import { reconcile, importOnce, mount, previewMount, acceptIgnores, heldBack, PULL_BUDGET, scanRemote } from "../src/lib/mount.js";
+import { reconcile, importOnce, mount, previewMount, acceptIgnores, heldBack, PULL_BUDGET, scanRemote, SCAN_CONCURRENCY, SCAN_WINDOW_BYTES } from "../src/lib/mount.js";
 import { ignoreFileProblem } from "../src/lib/ignore.js";
 
 const enc = (s) => new TextEncoder().encode(s);
@@ -963,10 +963,15 @@ describe("an interrupted pass loosens nothing [A3]", () => {
         let state = await reconcile({ vfs: real, dir, root: "/apps/p", state: {} });
         await real.writeFile("/apps/p/.vcsignore", enc("# tidy-up\n"));
         await real.writeFile("/apps/p/zz/.gitignore", enc("# more\n"));
-        // The second ignore file stalls once the first is on disk.
-        const { vfs, ctl } = stallingVfs(real, "/zz/.gitignore", () => exists(join(dir, ".vcsignore")));
+        // The second ignore file stalls when it is pulled — not when the scan
+        // reads it — and the first lands. Pulls are fetched ahead of landing,
+        // so its fetch starts before the first is on disk: waiting for that
+        // to stall it waited forever.
+        let looks = 0;
+        const { vfs, ctl } = stallingVfs(real, "/zz/.gitignore", () => ++looks > 1);
         void reconcile({ vfs, dir, root: "/apps/p", state, session: {} });
         await until(() => ctl.stalled);
+        await until(() => exists(join(dir, ".vcsignore")));
         ctl.on = false;
         // Restart.
         for (let i = 0; i < 2; i++) state = await reconcile({ vfs: real, dir, root: "/apps/p", state: await savedState(dir), session: {} });
@@ -999,9 +1004,12 @@ describe("an interrupted pass loosens nothing [A3]", () => {
         const dir = await tmp("a3-first");
         await put(dir, ".gitignore", "config/master.key\n");   // a git clone brings this
         await put(dir, "config/master.key", "RAILS_MASTER_KEY");
-        const { vfs, ctl } = stallingVfs(real, "/zz/.gitignore", () => exists(join(dir, ".vcsignore")));
+        // Stalled at its pull, with the first ignore file landed (see [A3] above).
+        let looks = 0;
+        const { vfs, ctl } = stallingVfs(real, "/zz/.gitignore", () => ++looks > 1);
         void reconcile({ vfs, dir, root: "/apps/p", state: {}, session: {} });
         await until(() => ctl.stalled);
+        await until(() => exists(join(dir, ".vcsignore")));
         ctl.on = false;
         for (let i = 0; i < 2; i++) await reconcile({ vfs: real, dir, root: "/apps/p", state: await savedState(dir), session: {} });
         expect(await real.exists("/apps/p/config/master.key")).toBe(false);
@@ -1212,12 +1220,15 @@ describe("stopping a mount [A10]", () => {
     });
 
     it("stops a long first pass between steps, and records what it did", async () => {
-        const files = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`/apps/p/f${i}.txt`, `f${i}`]));
+        // More files than the pulls fetched at once, so the pass is still
+        // going when it is stopped.
+        const n = 40;
+        const files = Object.fromEntries(Array.from({ length: n }, (_, i) => [`/apps/p/f${i}.txt`, `f${i}`]));
         const vfs = memVfs(files);
         const read = vfs.readFile.bind(vfs);
         let pulls = 0;
         vfs.readFile = async (p) => {
-            if (++pulls > 8) await sleep(250);   // the scan's reads are quick; the pulls are not
+            if (++pulls > n) await sleep(250);   // the scan's reads are quick; the pulls are not
             return read(p);
         };
         const dir = await tmp("a10-steps");
@@ -1229,7 +1240,7 @@ describe("stopping a mount [A10]", () => {
         await sleep(600);
         expect(pulls).toBe(after);   // nothing still running behind it
         const onDisk = (await readdir(dir)).filter((n) => n.endsWith(".txt")).map((n) => "/" + n).sort();
-        expect(onDisk.length).toBeLessThan(8);
+        expect(onDisk.length).toBeLessThan(n);
         expect(Object.keys(await savedState(dir)).sort()).toEqual(onDisk);
     });
 
@@ -2388,5 +2399,230 @@ describe("mount --dry-run holds uploads back as the pass does [review 3]", () =>
         expect(out).toMatch(/1 to upload/);
         state = await reconcile({ vfs, dir, root: "/apps/p", state });
         expect(vfs.calls.writeFile).toContain("/apps/p/new.txt");
+    });
+});
+
+describe("pulls overlap, and every limit still holds [perf 2026-10]", () => {
+    const KB = 1024;
+    const GiB = 1024 * 1024 * 1024;
+    const roomy = async () => ({ bsize: 4096, blocks: 1e9, bavail: 5e8 });
+    /**
+     * An in-memory vfs whose reads take a while, and which counts how many of
+     * the PULL's reads are in flight at once. It has no manifests, so nothing
+     * the scan read is reused: every pull reads again, as one past the pass's
+     * blob cache does. The first read of a path is the scan's; any later one
+     * is the pull's.
+     */
+    function slowVfs(files, { delay = 15 } = {}) {
+        const vfs = memVfs(files);
+        const seen = new Map();
+        const pulls = { inFlight: 0, max: 0, reads: 0 };
+        const readFile = vfs.readFile;
+        vfs.readFile = async (p) => {
+            const n = (seen.get(p) ?? 0) + 1;
+            seen.set(p, n);
+            const pull = n > 1;
+            if (pull) { pulls.reads++; pulls.max = Math.max(pulls.max, ++pulls.inFlight); }
+            try {
+                await sleep(delay);
+                return await readFile(p);
+            } finally {
+                if (pull) pulls.inFlight--;
+            }
+        };
+        return { vfs, pulls };
+    }
+    const many = (n, size = 100, under = "/apps/p") =>
+        Object.fromEntries(Array.from({ length: n }, (_, i) => [`${under}/d${i % 3}/sub/f${String(i).padStart(2, "0")}.txt`, String(i).padEnd(size, ".")]));
+    const landed = async (dir) => {
+        let n = 0;
+        for (const d of await readdir(dir)) {
+            if (d.startsWith(".")) continue;
+            n += (await readdir(join(dir, d, "sub")).catch(() => [])).length;
+        }
+        return n;
+    };
+
+    it("fetches several pulls at once, and lands every one — new directories included", async () => {
+        const files = many(24);
+        const { vfs, pulls } = slowVfs(files);
+        const dir = await tmp("perf-overlap");
+        const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: roomy } });
+        expect(pulls.reads).toBe(24);
+        expect(pulls.max).toBeGreaterThan(1);
+        expect(pulls.max).toBeLessThanOrEqual(8);
+        expect(await landed(dir)).toBe(24);
+        expect(Object.keys(state).sort()).toEqual(Object.keys(files).map((k) => k.slice("/apps/p".length)).sort());
+        for (const [k, v] of Object.entries(files)) expect(await read(join(dir, k.slice("/apps/p".length)))).toBe(v);
+        expect(lines.some((l) => /EEXIST|could not/.test(l))).toBe(false);
+    });
+
+    it("stops at the byte budget exactly, however many are in flight", async () => {
+        const { vfs } = slowVfs(many(30, KB));
+        const dir = await tmp("perf-bytes");
+        const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: roomy, pullBudget: { bytes: 10 * KB, files: 10_000 } } });
+        expect(await landed(dir)).toBe(10);
+        expect(Object.keys(state)).toHaveLength(10);
+    });
+
+    it("and at the file budget — reserving before it fetches, so a pull that cannot land is not fetched", async () => {
+        const { vfs, pulls } = slowVfs(many(30));
+        const dir = await tmp("perf-files");
+        const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: roomy, pullBudget: { bytes: GiB, files: 3 } } });
+        expect(await landed(dir)).toBe(3);
+        expect(Object.keys(state)).toHaveLength(3);
+        expect(pulls.reads).toBe(3);
+    });
+
+    it("never lets pulls in flight together cut into the disk reserve", async () => {
+        // A volume whose free space really shrinks as files land: room for
+        // three 1 KB files above the 1 GiB reserve, not four. Each pull alone
+        // fits; checked together, before any has landed, all would.
+        const { vfs, pulls } = slowVfs(many(12, KB));
+        const dir = await tmp("perf-reserve");
+        const written = async () => {
+            let total = 0;
+            for (const d of await readdir(dir)) {
+                if (d.startsWith(".")) continue;
+                for (const f of await readdir(join(dir, d, "sub")).catch(() => [])) total += (await stat(join(dir, d, "sub", f))).size;
+            }
+            return total;
+        };
+        const shrinking = async () => ({ bsize: 1, blocks: 2 * GiB, bavail: GiB + 3.5 * KB - (await written()) });
+        const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: shrinking } });
+        expect(await landed(dir)).toBe(3);
+        expect(Object.keys(state)).toHaveLength(3);
+        expect(lines.some((l) => /not pulling 9 files/.test(l))).toBe(true);
+        expect(pulls.reads).toBe(3);   // reserved before fetching: the rest were never fetched
+    });
+
+    it("stops starting pulls when told, and records only what landed", async () => {
+        const files = many(40);
+        const { vfs, pulls } = slowVfs(files, { delay: 30 });
+        const dir = await tmp("perf-abort");
+        const controller = new AbortController();
+        const reads = vfs.readFile;
+        vfs.readFile = async (p) => {
+            const out = reads(p);
+            if (pulls.reads >= 5) controller.abort();
+            return out;
+        };
+        const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: roomy }, signal: controller.signal });
+        expect(pulls.reads).toBeLessThan(40);
+        // What is recorded is exactly what is on disk.
+        expect(Object.keys(state)).toHaveLength(await landed(dir));
+        for (const k of Object.keys(state)) expect(await read(join(dir, k))).toBe(files[`/apps/p${k}`]);
+    });
+});
+
+describe("the scan's reads overlap, within a byte window [perf 2026-10]", () => {
+    const MB = 1024 * 1024;
+    /**
+     * A vfs whose files claim `declared` sizes in their records (the bytes
+     * read back stay small), whose reads take a while, and which records
+     * which reads are in flight together, and what their records claim.
+     */
+    function windowVfs(declared, { delay = 20, onRead } = {}) {
+        const paths = Object.keys(declared).sort();
+        const live = new Set();
+        const seen = { reads: 0, max: 0, maxBytes: 0, overlaps: [] };
+        return {
+            seen,
+            paths,
+            vfs: {
+                async exists() { return true; },
+                async walk() { return paths; },
+                async stat(p) { return { path: p, kind: "file", size: declared[p] }; },
+                async readFile(p) {
+                    seen.reads++;
+                    onRead?.(p, seen);
+                    live.add(p);
+                    const bytes = [...live].reduce((n, q) => n + declared[q], 0);
+                    seen.max = Math.max(seen.max, live.size);
+                    seen.maxBytes = Math.max(seen.maxBytes, bytes);
+                    seen.overlaps.push({ paths: [...live], bytes });
+                    try {
+                        await sleep(delay);
+                        return enc(`content of ${p}`);
+                    } finally {
+                        live.delete(p);
+                    }
+                },
+            },
+        };
+    }
+    const named = (n, size, prefix = "f") =>
+        Object.fromEntries(Array.from({ length: n }, (_, i) => [`/apps/p/${prefix}${String(i).padStart(3, "0")}.txt`, size]));
+
+    it("reads 16 small files at once, and hashes every one of them", async () => {
+        expect(SCAN_CONCURRENCY).toBe(16);
+        const { vfs, seen, paths } = windowVfs(named(64, 100));
+        const out = await scanRemote(vfs, "/apps/p", false, () => false, { paths });
+        expect(seen.max).toBe(16);
+        expect(seen.reads).toBe(64);
+        expect(Object.keys(out.files)).toHaveLength(64);
+        for (const p of paths) expect(out.files[p.slice("/apps/p".length)]).toBe(sha(`content of ${p}`));
+        expect(out.unknown.size).toBe(0);
+    });
+
+    it("keeps the bytes in flight within the window, but for one oversized file read alone", async () => {
+        expect(SCAN_WINDOW_BYTES).toBe(64 * MB);
+        const declared = { ...named(12, 20 * MB), ...named(2, 90 * MB, "big") };
+        const { vfs, seen, paths } = windowVfs(declared);
+        const out = await scanRemote(vfs, "/apps/p", false, () => false, { paths });
+        expect(seen.reads).toBe(14);
+        expect(Object.keys(out.files)).toHaveLength(14);
+        expect(seen.max).toBeGreaterThan(1);   // the window still overlaps the ones that fit
+        for (const { paths: live, bytes } of seen.overlaps) {
+            if (live.some((p) => p.includes("/big"))) expect(live).toHaveLength(1);
+            else expect(bytes).toBeLessThanOrEqual(SCAN_WINDOW_BYTES);
+        }
+    });
+
+    it("starts no read once aborted — including reads waiting on the window — and warns of none", async () => {
+        const controller = new AbortController();
+        let afterAbort = 0;
+        const { vfs, seen, paths } = windowVfs(named(40, 20 * MB), {
+            delay: 40,
+            onRead: () => {
+                if (controller.signal.aborted) afterAbort++;
+                else controller.abort();
+            },
+        });
+        const session = { readBudget: null };
+        await scanRemote(vfs, "/apps/p", false, () => false, { paths, signal: controller.signal, session });
+        expect(afterAbort).toBe(0);
+        expect(seen.reads).toBeLessThan(4);
+        expect([...session.warned].some((k) => k.startsWith("unreadable:"))).toBe(false);
+    });
+
+    it("still holds the pass's read budget, however many reads overlap", async () => {
+        // The read budget still counts every read, however many overlap.
+        const { vfs, seen, paths } = windowVfs(named(40, 100));
+        const out = await scanRemote(vfs, "/apps/p", false, () => false, { paths, session: { readBudget: { bytes: 2 * 1024 * MB, files: 10 } } });
+        expect(seen.reads).toBe(10);
+        expect(out.deferred.size).toBe(30);
+    });
+
+    it("counts a record whose size is not a number as 0, and neither hangs nor poisons the budgets", async () => {
+        // The size in a record is whatever the remote party wrote: absent, a
+        // string, negative. NaN in a claim made `held` NaN, and nothing fit again.
+        const paths = ["/apps/p/a.txt", "/apps/p/b.txt", "/apps/p/c.txt", "/apps/p/d.txt"];
+        const sizes = { "/apps/p/a.txt": undefined, "/apps/p/b.txt": "12", "/apps/p/c.txt": -5, "/apps/p/d.txt": 100 };
+        let reads = 0;
+        const vfs = {
+            async exists() { return true; },
+            async walk() { return paths; },
+            async stat(p) { return { path: p, kind: "file", size: sizes[p] }; },
+            async readFile(p) { reads++; return enc(`content of ${p}`); },
+        };
+        const session = { readBudget: { bytes: 2 * 1024 * MB, files: 10 } };
+        const spent = { bytes: 0, files: 0 };
+        const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("scan hung")), 3000));
+        const out = await Promise.race([scanRemote(vfs, "/apps/p", false, () => false, { paths, session, spent }), timeout]);
+        expect(reads).toBe(4);
+        expect(Object.keys(out.files)).toHaveLength(4);
+        expect(Number.isFinite(spent.bytes)).toBe(true);
+        expect(spent.bytes).toBe(paths.reduce((n, p) => n + `content of ${p}`.length, 0));
     });
 });
