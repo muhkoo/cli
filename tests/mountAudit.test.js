@@ -19,8 +19,11 @@ import { dirname, join } from "node:path";
 import { VfsNamespace } from "@muhkoo/connect";
 import { reconcile, importOnce, mount, previewMount, acceptIgnores, heldBack, PULL_BUDGET, scanRemote, SCAN_CONCURRENCY, SCAN_WINDOW_BYTES } from "../src/lib/mount.js";
 import { ignoreFileProblem } from "../src/lib/ignore.js";
+import { filesOf } from "../src/lib/syncPlan.js";
 
 const enc = (s) => new TextEncoder().encode(s);
+/** The state's files: folders are recorded too, under a trailing slash. */
+const fileKeys = (state) => Object.keys(state).filter((k) => !k.endsWith("/"));
 const dec = (b) => new TextDecoder().decode(b);
 const sha = (s) => createHash("sha256").update(s).digest("hex");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -60,7 +63,7 @@ function realVfs() {
 
 /** Count calls through to a vfs, without changing what they do. */
 function counting(vfs) {
-    const calls = { walk: 0, readFile: 0, writeFile: 0, delete: 0, stat: 0 };
+    const calls = { walk: 0, readFile: 0, readByManifest: 0, writeFile: 0, delete: 0, stat: 0 };
     const wrapped = new Proxy(vfs, {
         get(target, key) {
             const value = target[key];
@@ -185,7 +188,7 @@ describe("the default root \"/\" [N1]", () => {
         expect(await read(join(dir, "a.txt"))).toBe("local A");
         expect(await read(join(dir, "b.txt"))).toBe("local B");
         expect((await vfs.walk("/")).sort()).toEqual(["/a.txt", "/b.txt", "/notes/todo.md"]);
-        expect(Object.keys(state).sort()).toEqual(["/a.txt", "/b.txt", "/notes/todo.md"]);
+        expect(fileKeys(state).sort()).toEqual(["/a.txt", "/b.txt", "/notes/todo.md"]);
     });
 
     it("does not re-upload the project on every pass", async () => {
@@ -1700,7 +1703,7 @@ describe("what one pass may write here [L4]", () => {
         const session = { pullBudget: { bytes: 10 * MB, files: 10_000 }, statfs: roomy };
         const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session });
         expect(await pulledFiles(dir)).toBe(10);
-        expect(Object.keys(state)).toHaveLength(10);
+        expect(fileKeys(state)).toHaveLength(10);
         expect(lines.some((l) => /next pass/.test(l))).toBe(true);
     });
 
@@ -1740,7 +1743,7 @@ describe("what one pass may write here [L4]", () => {
         let state = {};
         for (let i = 0; i < 2; i++) state = await reconcile({ vfs, dir, root: "/apps/p", state, session });
         expect(await pulledFiles(dir)).toBe(0);
-        expect(state).toEqual({});
+        expect(filesOf(state)).toEqual({});
         expect(lines.filter((l) => /free/.test(l) && /reserve|less than/.test(l))).toHaveLength(1);
     });
 
@@ -1781,7 +1784,7 @@ describe("what one pass may write here [L4]", () => {
         const dir = await tmp("l4-lie-disk");
         const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: nearlyFull } });
         expect(await exists(join(dir, "blob.bin"))).toBe(false);
-        expect(state).toEqual({});
+        expect(filesOf(state)).toEqual({});
         expect(lines.some((l) => /not pulling 1 file/.test(l))).toBe(true);
     });
 
@@ -1794,7 +1797,7 @@ describe("what one pass may write here [L4]", () => {
             dir, root: "/apps/p", state: {}, session: { statfs: nearlyFull },
         });
         expect(await exists(join(dir, "blob.bin"))).toBe(false);
-        expect(state).toEqual({});
+        expect(filesOf(state)).toEqual({});
     });
 
     it("judges the pull budget by the bytes that come down", async () => {
@@ -1806,7 +1809,7 @@ describe("what one pass may write here [L4]", () => {
         const session = { pullBudget: { bytes: 10 * MB, files: 10_000 }, statfs: roomy };
         const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session });
         expect(await pulledFiles(dir)).toBe(10);
-        expect(Object.keys(state)).toHaveLength(10);
+        expect(fileKeys(state)).toHaveLength(10);
     });
 
     it("never pulls a file over the size limit, whatever its record says", async () => {
@@ -1817,7 +1820,7 @@ describe("what one pass may write here [L4]", () => {
         const dir = await tmp("l4-lie-huge");
         const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: roomy } });
         expect(await exists(join(dir, "huge.bin"))).toBe(false);
-        expect(Object.keys(state)).toEqual(["/small.txt"]);
+        expect(fileKeys(state)).toEqual(["/small.txt"]);
         expect(lines.some((l) => /huge\.bin/.test(l) && /over the mount limit/.test(l))).toBe(true);
     }, 30_000);
 
@@ -1830,7 +1833,7 @@ describe("what one pass may write here [L4]", () => {
             dir, root: "/apps/p", state: {}, session: { statfs: roomy },
         });
         expect(await exists(join(dir, "grows.bin"))).toBe(false);
-        expect(state).toEqual({});
+        expect(filesOf(state)).toEqual({});
     }, 30_000);
 });
 
@@ -1893,7 +1896,7 @@ describe("heavy or numerous ignore files from elsewhere [review 2]", () => {
             const pull = performance.now() - t0;
             t0 = performance.now();
             await reconcile({ vfs, dir, root: "/apps/p", state, session });
-            return { pull, steady: performance.now() - t0, pulled: Object.keys(state).length };
+            return { pull, steady: performance.now() - t0, pulled: fileKeys(state).length };
         };
         const control = await time(await tree("notignore.txt"));
         const nested = await time(await tree(".gitignore"));
@@ -1952,7 +1955,7 @@ describe("what one pass reads from your filesystem [review]", () => {
         const dir = await tmp("reads-shared");
         const session = { statfs: async () => ({ bsize: 4096, blocks: 1e9, bavail: 5e8 }) };
         let state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session });
-        expect(Object.keys(state)).toHaveLength(201);
+        expect(fileKeys(state)).toHaveLength(201);
         expect(reads.calls).toBe(1);
         reads.calls = 0;
         state = await reconcile({ vfs, dir, root: "/apps/p", state, session });
@@ -1999,7 +2002,7 @@ describe("what one pass reads from your filesystem [review]", () => {
         const dir = await tmp("reads-manifest");
         const state = await reconcile({ vfs, dir, root: "/apps/p", state: {} });
         expect(vfs.calls.readFile.filter((p) => !p.endsWith("ok.txt"))).toEqual([]);
-        expect(Object.keys(state)).toEqual(["/ok.txt"]);
+        expect(fileKeys(state)).toEqual(["/ok.txt"]);
         expect(lines.some((l) => /huge\.bin/.test(l) && /over the mount limit/.test(l))).toBe(true);
     });
 
@@ -2024,7 +2027,7 @@ describe("files already identical on both sides are in sync [review]", () => {
         const B = await tmp("same-b");
         await put(B, "src/app.js", "v1");
         let stateB = await reconcile({ vfs, dir: B, root: "/p", state: {} });
-        expect(stateB).toEqual({ "/src/app.js": sha("v1") });
+        expect(filesOf(stateB)).toEqual({ "/src/app.js": sha("v1") });
         await writeFile(join(A, "src", "app.js"), "v2 from A");
         stateA = await reconcile({ vfs, dir: A, root: "/p", state: stateA });
         stateB = await reconcile({ vfs, dir: B, root: "/p", state: stateB });
@@ -2452,7 +2455,7 @@ describe("pulls overlap, and every limit still holds [perf 2026-10]", () => {
         expect(pulls.max).toBeGreaterThan(1);
         expect(pulls.max).toBeLessThanOrEqual(8);
         expect(await landed(dir)).toBe(24);
-        expect(Object.keys(state).sort()).toEqual(Object.keys(files).map((k) => k.slice("/apps/p".length)).sort());
+        expect(fileKeys(state).sort()).toEqual(Object.keys(files).map((k) => k.slice("/apps/p".length)).sort());
         for (const [k, v] of Object.entries(files)) expect(await read(join(dir, k.slice("/apps/p".length)))).toBe(v);
         expect(lines.some((l) => /EEXIST|could not/.test(l))).toBe(false);
     });
@@ -2462,7 +2465,7 @@ describe("pulls overlap, and every limit still holds [perf 2026-10]", () => {
         const dir = await tmp("perf-bytes");
         const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: roomy, pullBudget: { bytes: 10 * KB, files: 10_000 } } });
         expect(await landed(dir)).toBe(10);
-        expect(Object.keys(state)).toHaveLength(10);
+        expect(fileKeys(state)).toHaveLength(10);
     });
 
     it("and at the file budget — reserving before it fetches, so a pull that cannot land is not fetched", async () => {
@@ -2470,7 +2473,7 @@ describe("pulls overlap, and every limit still holds [perf 2026-10]", () => {
         const dir = await tmp("perf-files");
         const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: roomy, pullBudget: { bytes: GiB, files: 3 } } });
         expect(await landed(dir)).toBe(3);
-        expect(Object.keys(state)).toHaveLength(3);
+        expect(fileKeys(state)).toHaveLength(3);
         expect(pulls.reads).toBe(3);
     });
 
@@ -2491,7 +2494,7 @@ describe("pulls overlap, and every limit still holds [perf 2026-10]", () => {
         const shrinking = async () => ({ bsize: 1, blocks: 2 * GiB, bavail: GiB + 3.5 * KB - (await written()) });
         const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: shrinking } });
         expect(await landed(dir)).toBe(3);
-        expect(Object.keys(state)).toHaveLength(3);
+        expect(fileKeys(state)).toHaveLength(3);
         expect(lines.some((l) => /not pulling 9 files/.test(l))).toBe(true);
         expect(pulls.reads).toBe(3);   // reserved before fetching: the rest were never fetched
     });
@@ -2510,8 +2513,8 @@ describe("pulls overlap, and every limit still holds [perf 2026-10]", () => {
         const state = await reconcile({ vfs, dir, root: "/apps/p", state: {}, session: { statfs: roomy }, signal: controller.signal });
         expect(pulls.reads).toBeLessThan(40);
         // What is recorded is exactly what is on disk.
-        expect(Object.keys(state)).toHaveLength(await landed(dir));
-        for (const k of Object.keys(state)) expect(await read(join(dir, k))).toBe(files[`/apps/p${k}`]);
+        expect(fileKeys(state)).toHaveLength(await landed(dir));
+        for (const k of fileKeys(state)) expect(await read(join(dir, k))).toBe(files[`/apps/p${k}`]);
     });
 });
 
@@ -2624,5 +2627,158 @@ describe("the scan's reads overlap, within a byte window [perf 2026-10]", () => 
         expect(Object.keys(out.files)).toHaveLength(4);
         expect(Number.isFinite(spent.bytes)).toBe(true);
         expect(spent.bytes).toBe(paths.reduce((n, p) => n + `content of ${p}`.length, 0));
+    });
+});
+
+describe("a restarted mount reads only content it has not hashed before", () => {
+    async function synced() {
+        const { vfs } = realVfs();
+        for (let i = 0; i < 5; i++) await vfs.writeFile(`/docs/f${i}.txt`, enc(`file ${i}`));
+        const dir = await tmp("hashcache");
+        const state = await reconcile({ vfs, dir, root: "/", state: {} });
+        return { vfs, dir, state };
+    }
+
+    it("reads no content for an unchanged tree", async () => {
+        const { vfs, dir, state } = await synced();
+        const { vfs: counted, calls } = counting(vfs);
+        await reconcile({ vfs: counted, dir, root: "/", state, session: {} });   // a fresh session: a restart
+        expect(calls.readByManifest + calls.readFile).toBe(0);
+    });
+
+    it("reads only the file that changed while it was stopped", async () => {
+        const { vfs, dir, state } = await synced();
+        await vfs.writeFile("/docs/f2.txt", enc("changed elsewhere"));
+        const { vfs: counted, calls } = counting(vfs);
+        await reconcile({ vfs: counted, dir, root: "/", state, session: {} });
+        expect(calls.readByManifest + calls.readFile).toBe(1);
+        expect(await read(join(dir, "docs", "f2.txt"))).toBe("changed elsewhere");
+    });
+
+    it("ignores a cache file it cannot trust, and reads everything again", async () => {
+        const { vfs, dir, state } = await synced();
+        for (const junk of ["not json", JSON.stringify({ v: 1, contents: { k: ["nothex", "x"] } }), JSON.stringify({ v: 99 })]) {
+            await writeFile(join(dir, ".muhkoo", "content-hashes.json"), junk);
+            const { vfs: counted, calls } = counting(vfs);
+            await reconcile({ vfs: counted, dir, root: "/", state, session: {} });
+            expect(calls.readByManifest + calls.readFile).toBe(5);
+            await rm(join(dir, ".muhkoo", "content-hashes.json"), { force: true });
+        }
+    });
+});
+
+describe("folders sync as well as files", () => {
+    const isDir = (p) => lstat(p).then((s) => s.isDirectory(), () => false);
+    const remoteKind = (vfs, p) => vfs.stat(p).then((s) => s.kind, () => null);
+
+    it("an empty folder made remotely comes down", async () => {
+        const { vfs } = realVfs();
+        await vfs.writeFile("/docs/a.txt", enc("a"));
+        await vfs.mkdir("/docs/empty/deeper", { recursive: true });
+        const dir = await tmp("dirs-down");
+        const state = await reconcile({ vfs, dir, root: "/", state: {} });
+        expect(await isDir(join(dir, "docs", "empty", "deeper"))).toBe(true);
+        expect(state["/docs/empty/deeper/"]).toBe("dir");
+    });
+
+    it("an empty folder made locally goes up", async () => {
+        const { vfs } = realVfs();
+        const dir = await tmp("dirs-up");
+        await mkdir(join(dir, "made", "here"), { recursive: true });
+        await reconcile({ vfs, dir, root: "/", state: {} });
+        expect(await remoteKind(vfs, "/made/here")).toBe("dir");
+    });
+
+    it("a folder removed locally is removed remotely, with --allow-delete", async () => {
+        const { vfs } = realVfs();
+        await vfs.writeFile("/keep.txt", enc("k"));
+        await vfs.writeFile("/old/a.txt", enc("a"));
+        await vfs.mkdir("/old/inner/empty", { recursive: true });
+        const dir = await tmp("dirs-rm-up");
+        let state = await reconcile({ vfs, dir, root: "/", state: {}, opts: { allowDelete: true } });
+        await rm(join(dir, "old"), { recursive: true });
+        state = await reconcile({ vfs, dir, root: "/", state, opts: { allowDelete: true } });
+        expect(await vfs.exists("/old")).toBe(false);
+        expect(await vfs.exists("/keep.txt")).toBe(true);
+        expect(Object.keys(state).filter((k) => k.startsWith("/old"))).toEqual([]);
+        // and it stays gone
+        state = await reconcile({ vfs, dir, root: "/", state, opts: { allowDelete: true } });
+        expect(await isDir(join(dir, "old"))).toBe(false);
+        expect(await vfs.exists("/old")).toBe(false);
+    });
+
+    it("a folder removed remotely is removed locally, with --allow-delete", async () => {
+        const { vfs } = realVfs();
+        await vfs.writeFile("/keep.txt", enc("k"));   // a root left empty trips the mass-delete breaker
+        await vfs.writeFile("/old/a.txt", enc("a"));
+        await vfs.mkdir("/old/empty", { recursive: true });
+        const dir = await tmp("dirs-rm-down");
+        let state = await reconcile({ vfs, dir, root: "/", state: {}, opts: { allowDelete: true } });
+        await vfs.delete("/old", { recursive: true });
+        state = await reconcile({ vfs, dir, root: "/", state, opts: { allowDelete: true } });
+        expect(await isDir(join(dir, "old"))).toBe(false);
+        expect(await read(join(dir, "keep.txt"))).toBe("k");
+    });
+
+    it("removes no folder when the breaker holds the file deletes", async () => {
+        const { vfs } = realVfs();
+        await vfs.writeFile("/old/a.txt", enc("a"));
+        await vfs.mkdir("/old/empty", { recursive: true });
+        const dir = await tmp("dirs-breaker");
+        let state = await reconcile({ vfs, dir, root: "/", state: {}, opts: { allowDelete: true } });
+        await vfs.delete("/old", { recursive: true });
+        state = await reconcile({ vfs, dir, root: "/", state, opts: { allowDelete: true } });
+        expect(await isDir(join(dir, "old", "empty"))).toBe(true);
+    });
+
+    it("never removes a folder that still holds a file that is not synced", async () => {
+        const { vfs } = realVfs();
+        await vfs.mkdir("/proj", { recursive: true });
+        const dir = await tmp("dirs-keep");
+        await put(dir, ".gitignore", "*.log\n");
+        let state = await reconcile({ vfs, dir, root: "/", state: {}, opts: { allowDelete: true } });
+        await put(dir, "proj/debug.log", "local only");
+        await vfs.delete("/proj", { recursive: true });
+        state = await reconcile({ vfs, dir, root: "/", state, opts: { allowDelete: true } });
+        expect(await read(join(dir, "proj", "debug.log"))).toBe("local only");
+    });
+
+    it("without --allow-delete, a removed folder is not removed on the other side", async () => {
+        const { vfs } = realVfs();
+        await vfs.mkdir("/gone/empty", { recursive: true });
+        const dir = await tmp("dirs-noflag");
+        let state = await reconcile({ vfs, dir, root: "/", state: {} });
+        await rm(join(dir, "gone"), { recursive: true });
+        state = await reconcile({ vfs, dir, root: "/", state });
+        expect(await remoteKind(vfs, "/gone/empty")).toBe("dir");
+    });
+
+    it("a refused folder is not made locally", async () => {
+        const { vfs } = realVfs();
+        await vfs.mkdir("/proj/.git/hooks", { recursive: true });
+        await vfs.mkdir("/proj/.ssh", { recursive: true });
+        const dir = await tmp("dirs-refused");
+        await reconcile({ vfs, dir, root: "/", state: {}, opts: { hidden: true } });
+        expect(await isDir(join(dir, "proj"))).toBe(true);
+        expect(await exists(join(dir, "proj", ".git"))).toBe(false);
+        expect(await exists(join(dir, "proj", ".ssh"))).toBe(false);
+    });
+
+    it("does not make a folder through a symlink", async () => {
+        const { vfs } = realVfs();
+        await vfs.mkdir("/link/inside", { recursive: true });
+        const dir = await tmp("dirs-symlink");
+        const outside = await tmp("dirs-outside");
+        await symlink(outside, join(dir, "link"));
+        await reconcile({ vfs, dir, root: "/", state: {} });
+        expect(await readdir(outside)).toEqual([]);
+    });
+
+    it("with no folder listing (an older SDK), plans nothing for folders", async () => {
+        const vfs = memVfs({ "/a/b.txt": "b" });
+        const dir = await tmp("dirs-old-sdk");
+        await mkdir(join(dir, "localonly"));
+        const state = await reconcile({ vfs, dir, root: "/", state: {} });
+        expect(Object.keys(state).filter((k) => k.endsWith("/"))).toEqual([]);
     });
 });

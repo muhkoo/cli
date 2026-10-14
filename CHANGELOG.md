@@ -4,6 +4,19 @@ All notable changes to `@muhkoo/cli` are documented here.
 
 ## Unreleased
 
+## 0.15.0-alpha.7 — `vfs mount` restarts in seconds, and syncs folders (2026-10-14)
+
+Released with @muhkoo/connect 0.15.0-alpha.7 (no SDK changes), and published with `npm run release`: both `alpha` and `latest` point at it.
+
+### Changed
+
+- **A restarted mount no longer downloads your whole tree.** To compare the two sides, the mount hashes each remote file's content. What it has hashed is now kept in `.muhkoo/content-hashes.json`, keyed by the file's manifest, so a restart reads only files that are new or changed. Mounting an unchanged 616-file drive went from about a minute to about 3 seconds. The first mount after upgrading still reads everything once. A cache file that is missing or not in the expected shape is ignored.
+
+### Fixed
+
+- **Folders sync, not just the files in them.** An empty folder made on either side now appears on the other. With `--allow-delete`, a folder removed on one side is removed on the other, deepest first, after the files in it. Only an empty folder is ever removed: one that still holds a file that is not synced (ignored, hidden or refused) is kept, and the mount says so. Folders follow the same refused-path and ignore rules as files, and no folder is removed in a pass where the mass-delete breaker holds the file deletes.
+- **After upgrading, empty folders you removed on one side before this release may reappear.** Earlier versions did not record folders, so the mount cannot tell an old removal from a new folder. Remove them again and the removal now carries over.
+
 ## 0.15.0-alpha.6 — faster `vfs mount` (2026-10-14)
 
 Released with @muhkoo/connect 0.15.0-alpha.6, and published with `npm run release`: both `alpha` and `latest` point at it.

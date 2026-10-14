@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { planPath, planSync, holdMassDeletes } from "../src/lib/syncPlan.js";
+import { planPath, planSync, holdMassDeletes, planDirs } from "../src/lib/syncPlan.js";
 
 const A = "hash-a";
 const B = "hash-b";
@@ -197,5 +197,35 @@ describe("holdMassDeletes measures against the most this session has tracked [L8
     it("measures against what is tracked now when that is the most", () => {
         expect(holdMassDeletes(deletes(9, "delete-local"), tracked(20), { local: 20, remote: 11 }, 12).held).toEqual([]);
         expect(holdMassDeletes(deletes(11, "delete-local"), tracked(20), { local: 20, remote: 9 }, 12).held).toHaveLength(1);
+    });
+});
+
+describe("planDirs — folders by the same three-way rule", () => {
+    const last = { "/a/": "dir", "/a/x.txt": "h", "/gone/": "dir" };
+
+    it("plans nothing when the remote folders could not be listed", () => {
+        expect(planDirs({ last, local: ["/new"], remote: null })).toEqual([]);
+    });
+
+    it("makes, removes, records and forgets", () => {
+        const plan = planDirs({ last, local: ["/a", "/mine"], remote: ["/theirs", "/both"].concat(["/a"]) });
+        expect(plan).toEqual([
+            { path: "/both", action: "mkdir-local" },
+            { path: "/gone", action: "forget" },
+            { path: "/mine", action: "mkdir-remote" },
+            { path: "/theirs", action: "mkdir-local" },
+        ]);
+        expect(planDirs({ last, local: ["/a"], remote: ["/a", "/gone"] })).toEqual([{ path: "/gone", action: "rmdir-remote" }]);
+        expect(planDirs({ last, local: ["/a", "/gone"], remote: ["/a"] })).toEqual([{ path: "/gone", action: "rmdir-local" }]);
+        expect(planDirs({ last: {}, local: ["/a"], remote: ["/a"] })).toEqual([{ path: "/a", action: "record" }]);
+    });
+
+    it("leaves alone a folder under an unknown path", () => {
+        expect(planDirs({ last, local: ["/a"], remote: ["/a"], unknown: ["/gone"] })).toEqual([]);
+    });
+
+    it("leaves alone every spelling a folding volume cannot tell apart", () => {
+        const fold = (p) => p.toLowerCase();
+        expect(planDirs({ last: { "/Docs/": "dir" }, local: ["/Docs"], remote: ["/docs"], fold })).toEqual([]);
     });
 });

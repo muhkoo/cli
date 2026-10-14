@@ -42,7 +42,7 @@ import { constants as fsConstants, watch } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
-import { holdMassDeletes, planSync } from "./syncPlan.js";
+import { DIR, dirKey, filesOf, holdMassDeletes, planDirs, planSync } from "./syncPlan.js";
 import {
     DEPTH_MAX, IgnoreBudgetError, NAME_MAX, caseFold, ignoreFileProblem, ruleBank, ruleText, withinMatchBounds,
 } from "./ignore.js";
@@ -221,6 +221,50 @@ async function loadState(dir, root) {
 
 async function saveState(dir, root, paths) {
     await writeAtomic(statePath(dir), JSON.stringify({ v: 1, root, paths }, null, 2) + "\n");
+}
+
+/**
+ * What the scan has hashed, kept between runs, so a restarted mount does not
+ * download the whole tree again just to learn it has not changed.
+ *
+ * It maps a content key — the SHA-256 of a file's manifest, which names the
+ * exact shards and the key that decrypts them, so one key is one content — to
+ * that content's hash and size. Unlike `mount.json` it decides nothing on its
+ * own: an entry only spares a read. So a file that cannot be read, or an entry
+ * that is not in the shape written here, is ignored, and that content is read.
+ */
+const hashCachePath = (dir) => join(dir, ".muhkoo", "content-hashes.json");
+const HEX64 = /^[0-9a-f]{64}$/;
+/** Entries kept: well past any tree the read budget lets one pass hash. */
+const HASH_CACHE_MAX = 200_000;
+
+async function loadHashCache(dir) {
+    const hashes = new Map();
+    try {
+        const saved = JSON.parse(await readFile(hashCachePath(dir), "utf8"));
+        if (saved?.v !== 1 || !saved.contents || typeof saved.contents !== "object") return hashes;
+        for (const [key, entry] of Object.entries(saved.contents)) {
+            if (hashes.size >= HASH_CACHE_MAX) break;
+            const [hash, size] = Array.isArray(entry) ? entry : [];
+            if (!HEX64.test(key) || !HEX64.test(hash ?? "") || !Number.isSafeInteger(size) || size < 0) return new Map();
+            hashes.set(key, { hash, size });
+        }
+    } catch {
+        return new Map();   // none yet, or unreadable: the scan reads, as it always did
+    }
+    return hashes;
+}
+
+function sameHashes(a, b) {
+    if (a.size !== b.size) return false;
+    for (const [key, { hash }] of a) if (b.get(key)?.hash !== hash) return false;
+    return true;
+}
+
+async function saveHashCache(dir, hashes) {
+    const contents = {};
+    for (const [key, { hash, size }] of hashes) contents[key] = [hash, size];
+    await writeAtomic(hashCachePath(dir), JSON.stringify({ v: 1, contents }) + "\n");
 }
 
 function sameState(a, b) {
@@ -969,6 +1013,7 @@ export async function foldsCaseReadOnly(dir) {
  */
 async function scanLocal(dir, { hidden = false, ignores, sess, signal }) {
     const files = {};
+    const dirs = [];
     const unknown = new Set();
     const held = new Set();
     const pace = pacer();
@@ -1006,6 +1051,7 @@ async function scanLocal(dir, { hidden = false, ignores, sess, signal }) {
             if (verdict === "held") held.add(entry.isDirectory() ? `${key}/` : key);
             if (verdict) continue;
             if (entry.isDirectory()) {
+                dirs.push(key);
                 await walk(child, rel);
                 continue;
             }
@@ -1031,7 +1077,7 @@ async function scanLocal(dir, { hidden = false, ignores, sess, signal }) {
         }
     };
     await walk(dir, "");
-    return { files, unknown, held };
+    return { files, dirs, unknown, held };
 }
 
 /**
@@ -1044,8 +1090,35 @@ async function scanLocal(dir, { hidden = false, ignores, sess, signal }) {
  * but this CLI may run against either.
  */
 async function walkRemote(vfs, root) {
-    if (root !== "/" && !(await vfs.exists(root))) return [];
-    return vfs.walk(root);
+    // `dirs` is null when the folders cannot be told: a root that is not there
+    // (missing or renamed — never "every folder deleted"), or an SDK without
+    // `walkEntries`. Folders are then left alone.
+    if (root !== "/" && !(await vfs.exists(root))) return { paths: [], dirs: null };
+    if (typeof vfs.walkEntries !== "function") return { paths: await vfs.walk(root), dirs: null };
+    const entries = await vfs.walkEntries(root);
+    return {
+        paths: entries.filter((e) => e.kind === "file").map((e) => e.path),
+        dirs: entries.filter((e) => e.kind === "dir").map((e) => e.path),
+    };
+}
+
+/**
+ * The remote folders, keyed like the local ones, through the same admission
+ * rule: a refused, ignored or hidden folder is not made here, any more than a
+ * file in it would be.
+ */
+function remoteDirs(dirs, root, { hidden, ignores, ignoreCase }) {
+    if (!dirs) return null;
+    const out = [];
+    for (const abs of dirs) {
+        const key = root === "/" ? abs : abs.slice(root.length);
+        if (!key.startsWith("/") || key === "/") continue;
+        const rel = key.slice(1);
+        if (!withinMatchBounds(rel, ignoreCase)) continue;
+        if (admission(rel, true, hidden, ignores.now, ignores.held)) continue;
+        out.push(key);
+    }
+    return out;
 }
 
 /**
@@ -1079,7 +1152,7 @@ export async function scanRemote(vfs, root, includeHidden = false, ignore = () =
     const unknown = new Set();
     const unreadable = new Set();
     const held = new Set();
-    const paths = ctx.paths ?? (await walkRemote(vfs, root));
+    const paths = ctx.paths ?? (await walkRemote(vfs, root)).paths;
 
     // Decide what to read BEFORE reading anything, so the filters are applied
     // once and the reads that survive them can go out together.
@@ -1599,7 +1672,7 @@ export function win32NameProblem(name) {
  * directories to create, in order, and `existing` the stats of the file being
  * replaced — or `{ ok: false, reason }`. `listing` caches `readdir` for a pass.
  */
-export async function writeTarget(dir, key, { localKeys = new Set(), listing = new Map(), platform = process.platform } = {}) {
+export async function writeTarget(dir, key, { localKeys = new Set(), listing = new Map(), platform = process.platform, kind = "file" } = {}) {
     const refuse = (reason) => ({ ok: false, reason });
     const names = key.split("/").filter(Boolean);
     if (!names.length) return refuse("it names the mount directory itself");
@@ -1625,13 +1698,18 @@ export async function writeTarget(dir, key, { localKeys = new Set(), listing = n
         if (!entries) return refuse(`${parent} could not be listed`);
         if (!entries.has(name)) {
             if (await present(abs)) return alias(name);
-            return { ok: true, abs: join(parent, ...names.slice(i)), parent, missing: names.slice(i, -1), existing: null };
+            // A folder is made whole, its own name included; a file's last name is the file.
+            return { ok: true, abs: join(parent, ...names.slice(i)), parent, missing: kind === "dir" ? names.slice(i) : names.slice(i, -1), existing: null };
         }
         const info = await lstat(abs).catch(() => null);
         if (!last) {
             if (!info?.isDirectory()) return refuse(`${relative(dir, abs)} is ${info?.isSymbolicLink() ? "a symlink" : "not a directory"}`);
             parent = abs;
             continue;
+        }
+        if (kind === "dir") {
+            if (!info?.isDirectory()) return refuse(`${relative(dir, abs)} is ${info?.isSymbolicLink() ? "a symlink" : "not a directory"}`);
+            return { ok: true, abs, parent, missing: [], existing: info };
         }
         if (!info?.isFile()) return refuse(`${relative(dir, abs)} is a symlink or not a regular file`);
         if (!localKeys.has(key)) return refuse(`${relative(dir, abs)} exists here but is not synced (ignored, hidden or refused), so it may exist nowhere else`);
@@ -1652,14 +1730,7 @@ export async function writeTarget(dir, key, { localKeys = new Set(), listing = n
  * default mode, never an execute bit.
  */
 async function writeAt(target, bytes, listing) {
-    let parent = target.parent;
-    for (const name of target.missing) {
-        const next = join(parent, name);
-        await mkdir(next);   // not recursive: each component is created here, never followed
-        listing.get(parent)?.add(name);
-        listing.set(next, new Set());
-        parent = next;
-    }
+    const parent = await makeMissing(target, listing);
     const tmp = join(parent, TMP_PREFIX + randomBytes(6).toString("hex"));
     try {
         await writeFile(tmp, bytes, { flag: "wx" });
@@ -1670,6 +1741,114 @@ async function writeAt(target, bytes, listing) {
         throw err;
     }
     listing.get(parent)?.add(target.abs.slice(parent.length + 1));
+}
+
+/**
+ * Apply the folder plan (`planDirs`), after the files: folders are made
+ * shallowest first and removed deepest first, so a folder emptied by this
+ * pass's file deletes is gone by its end.
+ *
+ * A folder is only ever removed EMPTY — `rmdir` here, a delete that is not
+ * recursive there — so removing one can never take a file with it, synced or
+ * not. One that still holds something (an ignored or refused file, or one that
+ * arrived since the scan) is kept, said once, and left out of the state: the
+ * next pass sees it on one side only and makes it on the other again, which is
+ * the truth, since it is not empty. Removals are gated by `--allow-delete` as
+ * file deletes are; a removal not made is forgotten, as theirs is.
+ */
+async function applyDirPlan({ vfs, dir, root, state, plan, opts, sess, signal }) {
+    const next = { ...state };
+    const listing = new Map();
+    const remoteAbs = (path) => (root === "/" ? path : root + path);
+    const depth = (path) => path.split("/").length;
+    const makes = plan.filter(({ action }) => !action.startsWith("rmdir")).sort((a, b) => depth(a.path) - depth(b.path));
+    const removes = plan.filter(({ action }) => action.startsWith("rmdir")).sort((a, b) => depth(b.path) - depth(a.path));
+    const kept = (path, where) => warnOnce(sess, `dir-kept:${where}:${path}`, `kept the folder ${path}/ ${where} — it still holds files that are not synced`);
+    for (const { path, action } of [...makes, ...removes]) {
+        if (signal?.aborted) break;
+        const key = dirKey(path);
+        try {
+            switch (action) {
+                case "record":
+                    next[key] = DIR;
+                    break;
+                case "forget":
+                    delete next[key];
+                    break;
+                case "mkdir-remote":
+                    await vfs.mkdir(remoteAbs(path), { recursive: true });
+                    next[key] = DIR;
+                    info(`${SIGN.push} ${path}/`);
+                    break;
+                case "mkdir-local": {
+                    const target = await writeTarget(dir, path, { listing, kind: "dir" });
+                    if (!target.ok) {
+                        warnOnce(sess, `declined:${action}:${path}`, `skipping ${path}/ — ${target.reason}`);
+                        break;
+                    }
+                    if (!target.existing) await makeMissing(target, listing);
+                    next[key] = DIR;
+                    info(`${SIGN.pull} ${path}/`);
+                    break;
+                }
+                case "rmdir-remote": {
+                    delete next[key];
+                    if (!opts.allowDelete) {
+                        warn(
+                            `${path}/ is gone locally but still in your filesystem — not deleting it.`,
+                            `  Pass --allow-delete to propagate deletions, or remove it with: muhkoo vfs rm -r ${remoteAbs(path)}`,
+                        );
+                        break;
+                    }
+                    const found = await vfs.stat(remoteAbs(path)).catch(() => null);
+                    if (found?.kind !== "dir") break;
+                    try {
+                        await vfs.delete(remoteAbs(path));   // not recursive: refused unless empty
+                        info(`${SIGN["delete-remote"]} ${path}/ (deleted from your filesystem)`);
+                    } catch {
+                        kept(path, "in your filesystem");
+                    }
+                    break;
+                }
+                case "rmdir-local": {
+                    delete next[key];
+                    if (!opts.allowDelete) {
+                        warn(`${path}/ is gone from your filesystem but still here — not deleting it locally.`, `  Pass --allow-delete to propagate deletions.`);
+                        break;
+                    }
+                    const target = await writeTarget(dir, path, { listing, kind: "dir" });
+                    if (!target.ok || !target.existing) break;
+                    try {
+                        await rmdir(target.abs);
+                        listing.get(target.parent)?.delete(target.abs.slice(target.parent.length + 1));
+                        listing.delete(target.abs);
+                        info(`${SIGN["delete-local"]} ${path}/ (deleted from this disk)`);
+                    } catch (err) {
+                        if (err.code !== "ENOTEMPTY" && err.code !== "EEXIST") throw err;
+                        kept(path, "on this disk");
+                    }
+                    break;
+                }
+            }
+        } catch (err) {
+            const message = err?.message ?? String(err);
+            warnOnce(sess, `error:${path}/:${message}`, `${path}/: ${message}`);
+        }
+    }
+    return next;
+}
+
+/** Make the directories `writeTarget` found missing, in order; returns the deepest. */
+async function makeMissing(target, listing) {
+    let parent = target.parent;
+    for (const name of target.missing) {
+        const next = join(parent, name);
+        await mkdir(next);   // not recursive: each component is created here, never followed
+        listing.get(parent)?.add(name);
+        listing.set(next, new Set());
+        parent = next;
+    }
+    return parent;
 }
 
 // ---- planning and applying ------------------------------------------------------
@@ -1694,7 +1873,7 @@ async function preparePass({ vfs, dir, rulesDir = dir, root, state, opts, sess, 
     // The remote walk is the slow part; start it while the local scan runs.
     // The remote FILTER has to wait for the local scan, which is what finds
     // the nested ignore files.
-    const [local, paths] = await Promise.all([
+    const [local, listed] = await Promise.all([
         scanLocal(dir, { hidden: opts.hidden, ignores, sess, signal }),
         walkRemote(vfs, root),
     ]);
@@ -1702,7 +1881,7 @@ async function preparePass({ vfs, dir, rulesDir = dir, root, state, opts, sess, 
     // The ignore files as they now stand are known; nothing has been pulled.
     await ignores.record(rulesDir, root, save);
     const remote = await scanRemote(vfs, root, opts.hidden, ignores.now, {
-        paths, held: ignores.held, session: sess, ignoreCase: sess.ignoreCase,
+        paths: listed.paths, held: ignores.held, session: sess, ignoreCase: sess.ignoreCase,
         localKeys: new Set(Object.keys(local.files)), signal, blobs, spent: read,
     });
     if (signal?.aborted) return null;
@@ -1723,13 +1902,24 @@ async function preparePass({ vfs, dir, rulesDir = dir, root, state, opts, sess, 
     if (keptBack.length) warnOnce(sess, `kept-back:${keptBack.join("\0")}`, ...heldNotice(keptBack, rulesDir));
 
     const unknown = new Set([...local.unknown, ...remote.unknown]);
-    const planned = planSync({ last: state, local: local.files, remote: remote.files, unknown });
+    const files = filesOf(state);
+    const planned = planSync({ last: files, local: local.files, remote: remote.files, unknown });
     const views = { local: Object.keys(local.files).length, remote: Object.keys(remote.files).length };
-    sess.peak = Math.max(sess.peak ?? 0, Object.keys(state).length);
-    const { plan, held } = holdMassDeletes(planned, state, views, sess.peak);
+    sess.peak = Math.max(sess.peak ?? 0, Object.keys(files).length);
+    const { plan, held } = holdMassDeletes(planned, files, views, sess.peak);
     for (const h of held) warnOnce(sess, `held:${h.action}:${h.count}`, ...breakerMessage(h, dir, root));
+    // Folders after files, by the same rule. When the breaker held file
+    // deletes, no folder is removed either: the same pass would empty them.
+    let dirPlan = planDirs({
+        last: state,
+        local: local.dirs,
+        remote: remoteDirs(listed.dirs, root, { hidden: opts.hidden, ignores, ignoreCase: sess.ignoreCase }),
+        unknown,
+        fold: sess.ignoreCase ? caseFold : null,
+    });
+    if (held.length) dirPlan = dirPlan.filter(({ action }) => !action.startsWith("rmdir"));
     return {
-        plan, local: local.files, remote: remote.files, sizes: remote.sizes, blobs: remote.blobs, ignores,
+        plan, dirPlan, local: local.files, remote: remote.files, sizes: remote.sizes, blobs: remote.blobs, ignores,
         unreadable: remote.unreadable, deferred: remote.deferred,
         landed: new Set(),     // ignore files pulled in this pass
         notLanded: new Map(),  // and why the others were not
@@ -2144,6 +2334,24 @@ function unreadRules(pass, state) {
 export async function reconcile({ vfs, dir, root, state, opts = {}, session: s, signal }) {
     const sess = session(s);
     if (signal?.aborted) return state;
+    // A restart begins with what earlier runs hashed (see `loadHashCache`).
+    if (!sess.hashCacheLoaded) {
+        sess.hashCacheLoaded = true;
+        if (sess.hashes.size === 0) sess.hashes = await loadHashCache(dir);
+        sess.hashCacheSaved = new Map(sess.hashes);
+    }
+    try {
+        return await reconcilePass({ vfs, dir, root, state, opts, sess, signal });
+    } finally {
+        // Written only when it changed: most passes hash nothing new.
+        if (!sameHashes(sess.hashes, sess.hashCacheSaved)) {
+            await saveHashCache(dir, sess.hashes).catch((err) => warn(`could not save the content hash cache: ${err?.message ?? err}`));
+            sess.hashCacheSaved = new Map(sess.hashes);
+        }
+    }
+}
+
+async function reconcilePass({ vfs, dir, root, state, opts, sess, signal }) {
     const budget = { bytes: 0, files: 0 };   // what the whole pass may pull, both rounds
     const read = { bytes: 0, files: 0 };     // and read to compare
     let pass = await preparePass({ vfs, dir, root, state, opts, sess, signal, read });
@@ -2188,7 +2396,10 @@ export async function reconcile({ vfs, dir, root, state, opts = {}, session: s, 
         );
     }
     const agreed = withAgreed(state, pass);
-    const next = plan.length ? await applyPlan({ vfs, dir, root, state: agreed, plan, pass, opts, sess, signal, budget }) : agreed;
+    let next = plan.length ? await applyPlan({ vfs, dir, root, state: agreed, plan, pass, opts, sess, signal, budget }) : agreed;
+    // While uploads wait on ignore rules, so do the folders going up.
+    const dirPlan = waiting.size ? pass.dirPlan.filter(({ action }) => !action.endsWith("-remote")) : pass.dirPlan;
+    if (dirPlan.length && !signal?.aborted) next = await applyDirPlan({ vfs, dir, root, state: next, plan: dirPlan, opts, sess, signal });
     await persist(dir, root, state, next);
     const short = pass.outstanding?.space ?? 0;
     if (short) {

@@ -67,6 +67,64 @@ export function planSync({ last, local, remote, unknown = [] }) {
     return plan;
 }
 
+/** What a folder is in the state file, in place of a content hash. */
+export const DIR = "dir";
+
+/** A folder's key in the state file: its path with a trailing slash, so it can never be a file's. */
+export const dirKey = (path) => `${path}/`;
+
+/** The state without its folders: what the file planner, and its breaker, count. */
+export function filesOf(state) {
+    const out = {};
+    for (const [key, hash] of Object.entries(state)) if (!key.endsWith("/")) out[key] = hash;
+    return out;
+}
+
+/**
+ * Plan the folders, by the same three-way rule as the files ({@link planPath}),
+ * with {@link DIR} standing in for a hash. `local` and `remote` are the folder
+ * paths each side holds (`remote` null when the folders could not be listed:
+ * then nothing is planned, since a folder not listed is not a folder gone).
+ *
+ * Returns `{ path, action }` with action one of: "record" (on both sides, not
+ * yet in the state), "mkdir-local", "mkdir-remote", "rmdir-local",
+ * "rmdir-remote", "forget". Paths in `unknown` are left alone, and so, when
+ * `fold` is given (a volume that folds names), is every folder whose folded
+ * name more than one spelling shares: which of them this disk holds cannot be
+ * told apart, and reading one as missing would plan its removal.
+ */
+export function planDirs({ last, local, remote, unknown = [], fold = null }) {
+    if (!remote) return [];
+    const isUnknown = coveredBy(unknown);
+    const before = new Set(Object.keys(last).filter((k) => k.endsWith("/")).map((k) => k.slice(0, -1)));
+    const here = new Set(local);
+    const there = new Set(remote);
+    const paths = new Set([...before, ...here, ...there]);
+    const clash = new Set();
+    if (fold) {
+        const spellings = new Map();
+        for (const path of paths) {
+            const folded = fold(path);
+            if (!spellings.has(folded)) spellings.set(folded, []);
+            spellings.get(folded).push(path);
+        }
+        for (const group of spellings.values()) if (group.length > 1) for (const path of group) clash.add(path);
+    }
+    const ACTIONS = { push: "mkdir-remote", pull: "mkdir-local", "delete-remote": "rmdir-remote", "delete-local": "rmdir-local", forget: "forget" };
+    const plan = [];
+    for (const path of [...paths].sort()) {
+        if (isUnknown(path) || clash.has(path)) continue;
+        const was = before.has(path) ? DIR : undefined;
+        const action = planPath({ last: was, local: here.has(path) ? DIR : undefined, remote: there.has(path) ? DIR : undefined });
+        if (action === "none") {
+            if (!was) plan.push({ path, action: "record" });
+        } else if (ACTIONS[action]) {
+            plan.push({ path, action: ACTIONS[action] });
+        }
+    }
+    return plan;
+}
+
 /**
  * `(path) => boolean`: is `path`, or a directory above it, in `prefixes`?
  *
