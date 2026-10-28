@@ -4,6 +4,14 @@ All notable changes to `@muhkoo/cli` are documented here.
 
 ## Unreleased
 
+## 0.15.0-alpha.10 — on @muhkoo/connect 0.15.0-alpha.10 (2026-10-28)
+
+Released with @muhkoo/connect 0.15.0-alpha.10, and published with `npm run release`: both `alpha` and `latest` point at it.
+
+### Security
+
+- **Sign-in no longer runs on a fake Poseidon hash.** The SDK used to substitute a SHA-256 stand-in when `circomlibjs` failed to load, so a broken install signed in with wrong values and no error. It now fails with `PoseidonUnavailableError`; reinstalling the CLI fixes it.
+
 ## 0.15.0-alpha.9 — dependency security patches (2026-10-14)
 
 Released with @muhkoo/connect 0.15.0-alpha.9 (dependency patches only, no SDK behaviour change), and published with `npm run release`: both `alpha` and `latest` point at it.
