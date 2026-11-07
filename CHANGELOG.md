@@ -4,6 +4,10 @@ All notable changes to `@muhkoo/cli` are documented here.
 
 ## Unreleased
 
+## 0.15.0-alpha.11 — on @muhkoo/connect 0.15.0-alpha.11 (2026-11-07)
+
+Released with @muhkoo/connect 0.15.0-alpha.11, and published with `npm run release`: both `alpha` and `latest` point at it. No CLI code changes; this keeps the CLI on the same SDK as apps (which adds Google sign-in without a username, `passkeyStatus`, hosted logout, and shared folders).
+
 ## 0.15.0-alpha.10 — on @muhkoo/connect 0.15.0-alpha.10 (2026-10-28)
 
 Released with @muhkoo/connect 0.15.0-alpha.10, and published with `npm run release`: both `alpha` and `latest` point at it.
