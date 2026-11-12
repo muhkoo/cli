@@ -36,7 +36,7 @@ const listed = (top, cmd) => new Set([...top.matchAll(new RegExp(`^\\s+${cmd} ([
  * Subcommands the command's source dispatches: its `case "…":` labels, and a
  * `sub === "…"` handled before the switch. Aliases are not documented.
  */
-const ALIASES = { vfs: ["push"], vcs: [], kv: [] };
+const ALIASES = { vfs: ["push"], vcs: [], kv: [], vectors: [] };
 const implemented = (cmd) => {
     const src = readFileSync(join(cliRoot, "src", "commands", `${cmd}.js`), "utf8");
     const names = [...src.matchAll(/case "([a-z-]+)":/g), ...src.matchAll(/sub === "([a-z-]+)"/g)].map((m) => m[1]);
@@ -47,7 +47,7 @@ const minus = (a, b) => [...a].filter((x) => !b.has(x)).sort();
 describe("muhkoo --help", () => {
     const top = run("--help");
 
-    for (const cmd of ["vfs", "vcs"]) {
+    for (const cmd of ["vfs", "vcs", "vectors"]) {
         it(`lists every ${cmd} subcommand that \`muhkoo ${cmd} --help\` documents`, () => {
             const want = documented(run(cmd, "--help"), cmd);
             expect(want.size).toBeGreaterThan(5);
@@ -74,5 +74,11 @@ describe("muhkoo --help", () => {
         expect([...documented(run("kv", "--help"), "kv")]).toEqual(["ls"]);
         expect([...listed(top, "kv")]).toEqual(["ls"]);
         expect([...implemented("kv")]).toEqual(["ls"]);
+    });
+
+    it("lists the vectors scopes in `muhkoo tokens --help`", () => {
+        const help = run("tokens", "--help");
+        expect(help).toContain("vectors:read");
+        expect(help).toContain("vectors:write");
     });
 });

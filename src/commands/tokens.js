@@ -20,6 +20,8 @@ const SCOPES = [
   "messages:write",
   "functions:invoke",
   "ai:infer",
+  "vectors:read",
+  "vectors:write",
 ];
 
 const DEFAULT_SCOPES = ["db:read", "db:write"];

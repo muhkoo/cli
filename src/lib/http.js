@@ -26,7 +26,10 @@ async function request(baseUrl, method, path, { auth, body, raw } = {}) {
   } catch {
     parsed = text;
   }
-  return { ok: res.ok, status: res.status, body: parsed };
+  const result = { ok: res.ok, status: res.status, body: parsed };
+  const retryAfter = res.headers?.get?.("Retry-After");
+  if (retryAfter != null) result.retryAfter = retryAfter;
+  return result;
 }
 
 /** A management call authenticated with a developer session token (Bearer). */

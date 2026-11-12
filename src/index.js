@@ -27,6 +27,7 @@ const COMMANDS = {
   hosting: () => import("./commands/hosting.js"),
   domains: () => import("./commands/domains.js"),
   tables: () => import("./commands/tables.js"),
+  vectors: () => import("./commands/vectors.js"),
   agents: () => import("./commands/agents.js"),
   functions: () => import("./commands/functions.js"),
   logs: () => import("./commands/logs.js"),
@@ -52,6 +53,7 @@ Apps
 Backend
   provision --spec <f>   create/update tables, agents, functions from a spec
   tables ls|get|rm       inspect database tables
+  vectors ls|get|create|rm|notices|query   vector search collections
   agents ls|get|rm|enable|disable|models
   functions ls|get|code|deploy|rm|enable|disable
 

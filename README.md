@@ -105,7 +105,7 @@ muhkoo whoami  --base https://api.example.com
 ```
 Account     login · logout · devices ls|rm · whoami
 Apps        apps ls|get|create|slug|rm · keys rotate · tokens ls|create|revoke
-Backend     provision · tables · agents · functions
+Backend     provision · tables · agents · functions · vectors ls|get|create|rm|notices|query
 Files       vfs cd|pwd|ls|stat|tree|cat|put|get|mkdir|rm|cp|mv|find|history|restore
             vfs import|mount|ignore · vfs sweep|use-app|app
             vcs status|commit|log|show|diff|branch|switch|checkout|merge|restore · vcs merge --abort
@@ -244,11 +244,39 @@ your own rules. The [CHANGELOG](./CHANGELOG.md) has the details.
     }
   ],
   "agents":    [ { "handle": "@helper", "model": "...", "systemPrompt": "...", "enableChannel": "general" } ],
-  "functions": [ { "name": "hello", "code": "export default { async fetch() { return new Response('hi'); } }" } ]
+  "functions": [ { "name": "hello", "code": "export default { async fetch() { return new Response('hi'); } }" } ],
+  "collections": [ { "name": "docs", "mode": "text", "fields": [ { "name": "category", "type": "string" } ] } ]
 }
 ```
 
 `provision` is idempotent — re-running updates tables/agents/functions in place.
+A collection whose definition hasn't changed is left alone. `provision` doesn't
+wait for a new collection to become ready. On a Free plan it skips collections
+with a warning (vector search needs a paid plan) and carries on. A collection
+definition can't change: if it differs from the existing one, `provision` stops
+and tells you to run `muhkoo vectors rm <appId> <name>` (which deletes its
+entries) before provisioning again.
+
+## Vector search
+
+```
+muhkoo vectors ls <appId> [--json]
+muhkoo vectors get <appId> <name> [--json]
+muhkoo vectors create <appId> <name> --mode text|vectors [--model <id>] [--dimensions <n>] [--metric cosine|euclidean|dot-product] [--fields name:type,...] [--access app|backend] [--no-wait]
+muhkoo vectors rm <appId> <name>
+muhkoo vectors notices <appId> <name> --env live|test --spaces <id,...> [--default <id>]
+muhkoo vectors query <name> (--text <query> | --vector <json>) [--topk <n>] [--filter <json>] [--with-text] [--key <app key>] [--json]
+```
+
+A new collection can take a few minutes to become ready, so `create` waits up
+to 10 minutes; pass `--no-wait` to return straight away and check later with
+`vectors get`. Vector search needs a paid plan. `query` uses an app key
+(`--key` or `MUHKOO_APP_KEY`) rather than your sign-in:
+
+```bash
+muhkoo vectors create <appId> docs --mode text --fields category:string
+muhkoo vectors query docs --text "forgot my password" --filter '{"category":"a"}' --key "$KEY"
+```
 
 ## License
 

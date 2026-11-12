@@ -40,7 +40,9 @@ export default async function apps(args) {
 
 async function list(ctx, args) {
   const r = ensure(await devCall(ctx, "GET", "/api/apps"), "List apps");
-  const apps = r.body?.apps || r.body || [];
+  // A deleted app stays in the account's list with `deletedAt` set; hide it,
+  // as the portal does. `apps get <appId>` still shows one, marked deleted.
+  const apps = (r.body?.apps || r.body || []).filter((a) => !a.deletedAt);
   if (args.json) return json(apps);
   if (!apps.length) return info("No apps yet. Create one with `muhkoo apps create --slug <name>`.");
   table(
@@ -57,6 +59,10 @@ async function get(ctx, args) {
   const a = r.body;
   info(`${c.bold("slug")}     ${a.slug}`);
   info(`${c.bold("appId")}    ${a.appId}`);
+  if (a.deletedAt) {
+    const d = new Date(a.deletedAt);
+    info(`${c.bold("deleted")}  ${Number.isNaN(d.getTime()) ? String(a.deletedAt) : d.toISOString().slice(0, 10)}`);
+  }
   info(`${c.bold("origins")}  ${a.allowedOrigins ?? "*"}`);
   info(`${c.bold("hosting")}  https://${a.slug}.${appsSuffixFor(ctx.baseUrl)}`);
   if (Array.isArray(a.keys)) {

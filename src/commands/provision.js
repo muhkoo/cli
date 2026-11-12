@@ -10,6 +10,7 @@
  *     "allowedOrigins": "*",
  *     "email": "you@example.com",            // only to bootstrap a new developer
  *     "tables":    [ <DbTableSpec>, ... ],
+ *     "collections": [ { "name": "docs", ...CollectionDefinition }, ... ],  // vector search; not waited on
  *     "agents":    [ { ...AgentCreateInput, "enableChannel": "general" }, ... ],
  *     "functions": [ { ...FunctionDeployInput, "enableChannel": "general"? }, ... ]
  *   }
@@ -17,7 +18,7 @@
 
 import { readFile, writeFile, access, chmod } from "node:fs/promises";
 import { devContext } from "../lib/config.js";
-import { devCall, appKeyGet } from "../lib/http.js";
+import { devCall, appKeyGet, ensure } from "../lib/http.js";
 import { appsSuffixFor } from "../lib/bases.js";
 import { step, ok, warn, info, die, c } from "../lib/ui.js";
 
@@ -66,6 +67,7 @@ export default async function provision(args) {
   const app = await createOrReuseApp(ctx, spec, prior, DRY);
   await applyHostingConfig(ctx, app.appId, spec, prior, DRY);
   const tables = await putTables(ctx, app.appId, spec.tables, DRY);
+  const collections = await putCollections(ctx, app.appId, spec.collections, DRY);
   const agents = await createAgents(ctx, app.appId, spec.agents, DRY);
   const functions = await deployFunctions(ctx, app.appId, spec.functions, DRY);
 
@@ -77,6 +79,7 @@ export default async function provision(args) {
     hostingUrl,
     keys: app.keys?.length ? app.keys : prior?.keys || [],
     tables,
+    collections,
     agents,
     functions,
   };
@@ -89,6 +92,10 @@ export default async function provision(args) {
   info(`  slug:    ${record.slug}`);
   if (pk) info(`  test pk: ${pk}`);
   info(`  tables:  ${tables.join(", ") || "(none)"}`);
+  if (collections.length) {
+    const label = (x) => `${x.name} (${x.skipped || x.status || "dry run"})`;
+    info(`  collections: ${collections.map(label).join(", ")}`);
+  }
   info(`  hosting: ${hostingUrl}  (run \`muhkoo deploy\` once your client is built)`);
   if ((agents || []).some((a) => a.enableChannel) || (functions || []).some((f) => f.enableChannel)) {
     info("", "Next: run the app once so its channels exist, then:");
@@ -157,6 +164,34 @@ async function putTables(ctx, appId, tables, DRY) {
     if (!r.ok) die(`Table "${spec.table}" failed (${r.status}): ${JSON.stringify(r.body)}`);
     info(`  ${c.green("✓")} ${spec.table}${r.body?.version ? ` v${r.body.version}` : ""}`);
     done.push(spec.table);
+  }
+  return done;
+}
+
+/** PUT each vector collection definition. 202 = created, 200 = already the
+ *  same definition. Doesn't wait for `ready` (that takes minutes). */
+async function putCollections(ctx, appId, specs, DRY) {
+  const done = [];
+  for (const { name, ...definition } of specs || []) {
+    step(`Collection "${name}"…`);
+    if (DRY) {
+      done.push({ name });
+      continue;
+    }
+    const r = await devCall(ctx, "PUT", `/api/apps/${appId}/vectors/collections/${encodeURIComponent(name)}`, definition);
+    if (r.status === 402) {
+      warn(`Vector search needs a paid plan — skipped ${name}. (Config saved for later.)`);
+      done.push({ name, skipped: "paid-tier" });
+      continue;
+    }
+    if (r.status === 409 && r.body?.code === "collection_exists") {
+      die(
+        `Collection "${name}" already exists with a different definition. Definitions can't change: run \`muhkoo vectors rm ${appId} ${name}\` (deletes its entries), then provision again.`,
+      );
+    }
+    ensure(r, `Collection "${name}"`);
+    info(`  ${c.green("✓")} ${name} (${r.status})`);
+    done.push({ name, status: r.status });
   }
   return done;
 }

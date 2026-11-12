@@ -2,7 +2,19 @@
 
 All notable changes to `@muhkoo/cli` are documented here.
 
-## Unreleased
+## 0.15.0-alpha.13 — deleted apps leave `apps ls`, on @muhkoo/connect 0.15.0-alpha.13 (2026-11-11)
+
+Released with @muhkoo/connect 0.15.0-alpha.13 (no SDK changes), and published with `npm run release`: both `alpha` and `latest` point at it.
+
+- **`muhkoo apps ls`** hides deleted apps, as the portal does (the server keeps them with `deletedAt` set). `muhkoo apps get <appId>` still shows a deleted app, with the date it was deleted.
+
+## 0.15.0-alpha.12 — vector search, on @muhkoo/connect 0.15.0-alpha.12 (2026-11-11)
+
+Released with @muhkoo/connect 0.15.0-alpha.12, and published with `npm run release`: both `alpha` and `latest` point at it.
+
+- **`muhkoo vectors`** manages an app's vector search collections: `ls`, `get`, `create`, `rm`, `notices` and `query`. `create` waits up to 10 minutes for a new collection to become ready (`--no-wait` skips the wait). `query` takes an app key (`--key` or `MUHKOO_APP_KEY`) and needs no sign-in. Vector search needs a paid plan.
+- **`collections` in `muhkoo provision`.** A spec can list vector search collections. `provision` creates them without waiting for them to become ready, skips them with a warning on a Free plan, and stops if a definition has changed, telling you to run `muhkoo vectors rm` first.
+- **`muhkoo tokens --help`** lists the `vectors:read` and `vectors:write` scopes. A key for `muhkoo vectors query` needs `vectors:read`.
 
 ## 0.15.0-alpha.11 — on @muhkoo/connect 0.15.0-alpha.11 (2026-11-07)
 
