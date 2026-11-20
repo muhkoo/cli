@@ -2,6 +2,25 @@
 
 All notable changes to `@muhkoo/cli` are documented here.
 
+## 0.15.0-alpha.15 — the filesystem is billed to your account, deploy goes to test unless --prod, and an MCP server for Claude, on @muhkoo/connect 0.15.0-alpha.15 (2026-11-20)
+
+Released with @muhkoo/connect 0.15.0-alpha.15 (keyless filesystem writes and `client.vfs.rehome`), and published with `npm run release`: both `alpha` and `latest` point at it.
+
+- **No app key for the filesystem.** `muhkoo vfs put`, `rm`, `cp`, `mv`, `restore`, `import` and `mount` write with your login alone, and storage is billed to your account. `vfs use-app`, `vfs app`, `--app` and `--key` now print "Not needed any more: your filesystem is billed to your account." and do nothing; an `MUHKOO_APP_KEY` in the environment is no longer picked up for the filesystem.
+- **`muhkoo vfs rehome [--dry-run] [--json]`** moves files an older IDE or Cloud Drive stored under an app to your account. It tries the IDE and Cloud Drive for the API base you use, plus the apps named by any earlier `vfs use-app`. `--dry-run` lists the file count and the candidate apps and changes nothing. It prints moved, already moved, not held and failed counts, and exits 1 if any failed so a script can retry.
+- **`muhkoo deploy`'s filesystem copy needs no key**, so it no longer skips for lack of one. The reasons it still skips (not signed in, signed in to another environment, no slug, machine not paired with no terminal) and a failed copy are warnings, repeated in the closing summary.
+- **`muhkoo deploy` goes to test unless you pass `--prod`.** A deploy with your developer session used to land in production. It now goes to the app's test environment, like a deploy with the test key. `--prod` deploys to production with the app's live secret key (the one in `.muhkoo-app.json`, `--key` or `$MUHKOO_DEPLOY_KEY`) or your session. A live key without `--prod` is refused, and so is a test key with `--prod`. **Breaking for CI:** a workflow that deploys with a live key must add `--prod`. Older CLIs ignore the flag, so it is safe to add before upgrading. The output now names the environment.
+- **`muhkoo mcp`: an MCP server for Claude.** Claude Desktop (through the Muhkoo extension, `npm run build:mcpb` → `dist/muhkoo.mcpb`) and Claude Code get one tool per CLI action, signed in as whoever ran `muhkoo login`. `deploy` publishes to the app's test environment. Promoting, deleting, rotating keys and minting tokens are marked destructive, so Claude asks first. Secret keys and access tokens are saved to owner-only files (the project's `.muhkoo-app.json`, or `~/.muhkoo/secrets/`) and never returned. `vfs mount`, `vfs cd`/`pwd` and `eject` have no tool.
+- **`--json` is now a contract**: stdout carries exactly one JSON object, progress goes to stderr, and failures (thrown errors included) print `{"error": "…"}` and exit 1. `deploy`, `provision`, `login` (never the session token) and `logout` gained `--json`.
+- **Prompts fail at once when nothing can answer them** (`MUHKOO_NONINTERACTIVE=1`, set by the MCP server), instead of waiting on stdin.
+
+## 0.15.0-alpha.14 — deploy copies the project into your filesystem, on @muhkoo/connect 0.15.0-alpha.14 (2026-11-14)
+
+Released with @muhkoo/connect 0.15.0-alpha.14 (no SDK changes), and published with `npm run release`: both `alpha` and `latest` point at it.
+
+- **`muhkoo deploy` copies the project to `/apps/<slug>`** in your filesystem once the release is live, so the portal's **Open in IDE** finds its files. It is the copy `muhkoo vfs import . --path /apps/<slug>` makes, run on the folder `deploy` ran from, under the same ignore rules: only files changed locally upload, and nothing is deleted. `<slug>` is the app's own, from the server, whatever the folder is called. The copy needs you signed in to the same environment and this machine paired, or a terminal to pair it in. Without them, as in CI with only a deploy key, `deploy` says why in one line and skips it. A failed copy is a warning, not a failed deploy. Storage for the copy is billed to the deployed app, using its publishable key from `.muhkoo-app.json`, or else to the app you write your filesystem as (`muhkoo vfs use-app`). `--no-vfs` skips the copy.
+- **`.muhkoo-app.json` never syncs**, in either direction, even with `--hidden`: it holds the app's secret keys.
+
 ## 0.15.0-alpha.13 — deleted apps leave `apps ls`, on @muhkoo/connect 0.15.0-alpha.13 (2026-11-11)
 
 Released with @muhkoo/connect 0.15.0-alpha.13 (no SDK changes), and published with `npm run release`: both `alpha` and `latest` point at it.

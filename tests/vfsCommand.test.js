@@ -1102,3 +1102,132 @@ describe("vfs mount and import take --path as a Muhkoo path [swapped arguments]"
         expect(entry("mount")).toMatch(/not the folders? above it/);
     });
 });
+
+describe("the filesystem is billed to your account, not an app", () => {
+    const IDE_PROD = "36bfe1582aaf98e95157e8f80d519d10";
+    const DRIVE_PROD = "53f8d3d5fb6faa9dcefa9df5aba1ae04";
+    const NOT_NEEDED = "Not needed any more: your filesystem is billed to your account.";
+    const configFile = () => join(home, ".muhkoo", "config.json");
+    const writeConfig = async (cfg) => {
+        await mkdir(join(home, ".muhkoo"), { recursive: true });
+        await writeFile(configFile(), JSON.stringify(cfg));
+    };
+    const out = () => lines.join("\n");
+    let fetched;
+
+    beforeEach(() => {
+        fetched = [];
+        vi.stubGlobal("fetch", async (url, init = {}) => {
+            fetched.push({ url: String(url), method: init.method ?? "GET" });
+            if (String(url).endsWith("/api/apps")) {
+                return new Response(JSON.stringify({ apps: [{ slug: "notes", appId: "app-notes" }, { slug: "gone", appId: "app-gone", deletedAt: 1 }] }));
+            }
+            return new Response("{}", { status: 404 });
+        });
+    });
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("a write with no app configured just works", async () => {
+        const vfs = realVfs();
+        globalThis.__muhkooTestClient = { vfs };
+        const file = join(await tmp("noapp"), "a.txt");
+        await writeFile(file, "hello");
+        await vfsCommand({ _: ["vfs", "put", file, "/a.txt"] });
+        expect(new TextDecoder().decode(await vfs.readFile("/a.txt"))).toBe("hello");
+        expect(out()).not.toMatch(/app key|use-app/i);
+    });
+
+    it("use-app prints the notice and leaves the config untouched", async () => {
+        await writeConfig({ token: "t" });
+        const before = await readFile(configFile(), "utf8");
+        await vfsCommand({ _: ["vfs", "use-app", "x"], key: "y" });
+        expect(out()).toContain(NOT_NEEDED);
+        expect(await readFile(configFile(), "utf8")).toBe(before);
+        expect(fetched).toEqual([]);
+    });
+
+    it("--key on another subcommand prints the notice and carries on", async () => {
+        globalThis.__muhkooTestClient = { vfs: realVfs() };
+        await vfsCommand({ _: ["vfs", "pwd"], key: "mk_live_pk_x" });
+        expect(out()).toContain(NOT_NEEDED);
+        expect(globalThis.__muhkooOpenedWith.key).toBeUndefined();
+    });
+
+    describe("rehome", () => {
+        it("--dry-run reports the file count and candidates, and calls nothing", async () => {
+            await writeConfig({ token: "t", base: "prod", vfsApps: { notes: "mk_live_pk_n" } });
+            const vfs = realVfs();
+            await vfs.writeFile("/a.txt", enc("a"));
+            await vfs.writeFile("/d/b.txt", enc("b"));
+            vfs.rehome = vi.fn();
+            globalThis.__muhkooTestClient = { vfs };
+            await vfsCommand({ _: ["vfs", "rehome"], "dry-run": true });
+            expect(vfs.rehome).not.toHaveBeenCalled();
+            expect(fetched.every((f) => f.method === "GET")).toBe(true);
+            expect(globalThis.__muhkooOpenedWith).toMatchObject({ readOnly: true, pair: false });
+            expect(out()).toMatch(/2 files/);
+            for (const id of [IDE_PROD, DRIVE_PROD, "app-notes"]) expect(out()).toContain(id);
+            expect(out()).not.toContain("app-gone");
+        });
+
+        it("moves from the built-ins plus the slugs in vfsApps, and reports the four counts", async () => {
+            await writeConfig({ token: "t", base: "prod", vfsApps: { notes: "mk_live_pk_n" } });
+            const rehome = vi.fn(async () => ({ moved: 5, alreadyMoved: 2, notHeld: 1, failed: 0 }));
+            globalThis.__muhkooTestClient = { vfs: { rehome } };
+            await vfsCommand({ _: ["vfs", "rehome"] });
+            const [opts] = rehome.mock.calls[0];
+            expect(opts.fromAppIds.sort()).toEqual([DRIVE_PROD, IDE_PROD, "app-notes"].sort());
+            expect(out()).toMatch(/moved\W+5/i);
+            expect(out()).toMatch(/already moved\W+2/i);
+            expect(out()).toMatch(/not held\W+1/i);
+            expect(out()).toMatch(/failed\W+0/i);
+        });
+
+        it("on a terminal, ends the progress line before the summary", async () => {
+            await writeConfig({ token: "t", base: "prod" });
+            globalThis.__muhkooTestClient = {
+                vfs: { rehome: async (o) => { o.onProgress(1, 2); o.onProgress(2, 2); return { moved: 2, alreadyMoved: 0, notHeld: 0, failed: 0 }; } },
+            };
+            const tty = Object.getOwnPropertyDescriptor(process.stderr, "isTTY");
+            Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });
+            const writes = [];
+            const write = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => { writes.push(String(chunk)); return true; });
+            try {
+                await vfsCommand({ _: ["vfs", "rehome"] });
+            } finally {
+                write.mockRestore();
+                if (tty) Object.defineProperty(process.stderr, "isTTY", tty);
+                else delete process.stderr.isTTY;
+            }
+            expect(writes).toEqual(["\r  1/2", "\r  2/2", "\n"]);
+        });
+
+        it("--json prints the result object; failed > 0 exits 1", async () => {
+            await writeConfig({ token: "t", base: "prod" });
+            const result = { moved: 1, alreadyMoved: 0, notHeld: 0, failed: 3 };
+            globalThis.__muhkooTestClient = { vfs: { rehome: async () => result } };
+            const exit = vi.spyOn(process, "exit").mockImplementation((c) => { throw new Error(`exit ${c}`); });
+            await expect(vfsCommand({ _: ["vfs", "rehome"], json: true })).rejects.toThrow("exit 1");
+            expect(JSON.parse(out().match(/\{[\s\S]*\}/)[0])).toEqual(result);
+            exit.mockRestore();
+        });
+
+        it("a failed app lookup still rehomes from the built-ins, with one line saying so", async () => {
+            await writeConfig({ token: "t", base: "prod", vfsApps: { notes: "k" } });
+            vi.stubGlobal("fetch", async () => { throw new Error("offline"); });
+            const rehome = vi.fn(async () => ({ moved: 0, alreadyMoved: 0, notHeld: 0, failed: 0 }));
+            globalThis.__muhkooTestClient = { vfs: { rehome } };
+            await vfsCommand({ _: ["vfs", "rehome"] });
+            expect(rehome.mock.calls[0][0].fromAppIds.sort()).toEqual([DRIVE_PROD, IDE_PROD].sort());
+            expect(lines.filter((l) => /app list/i.test(l))).toHaveLength(1);
+        });
+
+        it("a local base has no built-in candidates", async () => {
+            await writeConfig({ token: "t", base: "http://localhost:8787" });
+            const rehome = vi.fn(async () => ({ moved: 0, alreadyMoved: 0, notHeld: 0, failed: 0 }));
+            globalThis.__muhkooTestClient = { vfs: { rehome } };
+            await vfsCommand({ _: ["vfs", "rehome"] });
+            expect(rehome.mock.calls[0][0].fromAppIds).toEqual([]);
+        });
+    });
+});

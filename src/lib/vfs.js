@@ -31,6 +31,7 @@ import { die, info, step, prompt, promptHidden } from "./ui.js";
  */
 export async function openClient(args) {
   const { cfg, baseUrl, client } = await restoreSession(args);
+  requireFilesystemSdk(client);
 
   await unlock({ args, cfg, baseUrl, client });
 
@@ -45,6 +46,18 @@ export async function openClient(args) {
     });
   }
   return client;
+}
+
+/**
+ * The VFS commands open a Client with no app key, which only an SDK that bills
+ * the filesystem to the signed-in account supports (`@muhkoo/connect`
+ * 0.15.0-alpha.15, the release that added `vfs.rehome`). An older SDK would
+ * fail on the first write with a confusing "API key required", so stop here.
+ */
+function requireFilesystemSdk(client) {
+  if (typeof client?.vfs?.rehome !== "function") {
+    die("This CLI needs @muhkoo/connect 0.15.0-alpha.15 or newer — reinstall the CLI.");
+  }
 }
 
 /**
@@ -63,15 +76,11 @@ async function restoreSession(args) {
   const token = args.token || process.env.MUHKOO_DEV_TOKEN || cfg.token;
   if (!token) die("Not signed in. Run `muhkoo login` first.");
 
-  // Storing bytes is METERED, and the shard store attributes them to an app —
-  // so a write needs an app key even though the filesystem is the user's own.
-  // Reads do not, which is why ls and cat work with no app signed in at all.
-  const apiKey = resolveAppKey(args, cfg);
-
+  // No app key: the filesystem is the signed-in user's own, and its storage is
+  // billed to their account. The session below is all a read or a write needs.
   const Client = await loadClient();
   const client = new Client({
     baseUrl,
-    apiKey,
     // Hand the SDK the session we already hold instead of logging in again.
     sessionStore: {
       load: () => ({ token, username: cfg.username ?? "", commitment: cfg.commitment ?? "" }),
@@ -160,13 +169,41 @@ async function pairThisMachine({ args, cfg, baseUrl, client }) {
     return;
   }
 
+  const { factorId, label } = await pairWithSeed({ cfg, baseUrl, username, seed, client: authed });
+  client.auth.zk.unlockWithSeed(seed);
+  info(`Paired this machine as "${label}". Revoke it any time: muhkoo devices rm ${factorId}`);
+}
+
+/**
+ * Pair this machine from a seed already in hand (the browser login hands one
+ * over): enrol a device factor and save its key, so no later command asks for a
+ * password. Needs only the session and the seed — `enrollDevice` wraps the seed
+ * under a fresh local key and puts it in the vault, with no ZK proof.
+ *
+ * `client` is for a caller that already holds a signed-in Client; otherwise one
+ * is built over the stored session.
+ */
+export async function pairWithSeed({ cfg, baseUrl, token, username, commitment, seed, client }) {
+  if (!client) {
+    const Client = await loadClient();
+    client = new Client({
+      baseUrl,
+      sessionStore: {
+        load: () => ({ token, username: username ?? "", commitment: commitment ?? "" }),
+        save: () => {},
+        clear: () => {},
+      },
+    });
+    const user = await client.auth.zk.restore();
+    if (!user) throw new Error("Your session has expired. Run `muhkoo login` and try again.");
+    client.auth.zk.unlockWithSeed(seed);
+  }
   const label = deviceLabel();
-  const { factorId, deviceKey } = await authed.auth.zk.enrollDevice(label);
+  const { factorId, deviceKey } = await client.auth.zk.enrollDevice(label);
   // `seed: undefined` clears a seed left by an older CLI — the whole point is
   // that it stops living on this disk.
   await saveConfig({ ...cfg, username, deviceFactorId: factorId, deviceKey, seed: undefined });
-  client.auth.zk.unlockWithSeed(seed);
-  info(`Paired this machine as "${label}". Revoke it any time: muhkoo devices rm ${factorId}`);
+  return { factorId, label };
 }
 
 /**
@@ -182,39 +219,4 @@ function pairs(args) {
 /** A name the owner will recognise in `muhkoo devices ls`. */
 function deviceLabel() {
   return `${userInfo().username}@${hostname()}`;
-}
-
-/**
- * The key to write as, from `--key`, the environment, or the app signed in with
- * `muhkoo vfs use-app`.
- *
- * Absent is a legitimate state, not an error: reads work without one, so this
- * returns undefined and lets the write itself fail with an explanation.
- */
-function resolveAppKey(args, cfg) {
-  if (args.key) return args.key;
-  if (process.env.MUHKOO_APP_KEY) return process.env.MUHKOO_APP_KEY;
-  const slug = args.app || cfg.vfsApp;
-  if (!slug) return undefined;
-  return (cfg.vfsApps ?? {})[slug];
-}
-
-/**
- * Turn the shard store's 401 into an instruction: the lines to print, or null
- * when `err` is some other failure.
- *
- * "API key required to store shards" is accurate and useless — it names a
- * concept the person at the terminal has no reason to know, and says nothing
- * about what to do next.
- */
-export function explainWriteFailure(err, cfg) {
-  const msg = err?.message ?? String(err);
-  if (!/API key required|store shards|401/.test(msg)) return null;
-  const known = Object.keys(cfg?.vfsApps ?? {});
-  return [
-    "Writing stores bytes, which are metered to an app — so a write needs one signed in.",
-    ...(known.length
-      ? [`Try: muhkoo vfs use-app ${known[0]}`]
-      : ["Sign one in with: muhkoo vfs use-app <slug> --key <appKey>", "App keys are shown when an app is created (muhkoo apps create)."]),
-  ];
 }

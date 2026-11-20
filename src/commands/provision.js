@@ -20,7 +20,8 @@ import { readFile, writeFile, access, chmod } from "node:fs/promises";
 import { devContext } from "../lib/config.js";
 import { devCall, appKeyGet, ensure } from "../lib/http.js";
 import { appsSuffixFor } from "../lib/bases.js";
-import { step, ok, warn, info, die, c } from "../lib/ui.js";
+import { step, ok, warn, info, die, c, json } from "../lib/ui.js";
+import { resolve as resolvePath } from "node:path";
 
 export const help = `muhkoo provision — provision an app backend from a spec
 
@@ -100,6 +101,21 @@ export default async function provision(args) {
   if ((agents || []).some((a) => a.enableChannel) || (functions || []).some((f) => f.enableChannel)) {
     info("", "Next: run the app once so its channels exist, then:");
     info(`  muhkoo provision --spec ${args.spec} --enable`);
+  }
+  if (args.json) {
+    json({
+      appId: record.appId,
+      slug: record.slug,
+      base: ctx.baseUrl,
+      recordPath: resolvePath(OUT),
+      dryRun: DRY,
+      tables,
+      collections,
+      hostingUrl,
+      // The record's keys as written. The MCP server seals the secret ones
+      // into files before anything reaches a conversation.
+      keys: record.keys,
+    });
   }
 }
 

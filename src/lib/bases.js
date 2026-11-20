@@ -15,6 +15,14 @@ export function resolveBaseUrl(value) {
   return BASES[value] || value;
 }
 
+/** A plain name for an API base: "production", "staging", "local", or "custom". */
+export function platformFor(baseUrl) {
+  if (baseUrl === BASES.prod) return "production";
+  if (baseUrl === BASES.staging) return "staging";
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(baseUrl)) return "local";
+  return "custom";
+}
+
 /** The public hosting host suffix for an API base (apps.* / apps.staging.*). */
 export function appsSuffixFor(baseUrl) {
   return baseUrl.includes("staging") ? "apps.staging.muhkoo.dev" : "apps.muhkoo.dev";

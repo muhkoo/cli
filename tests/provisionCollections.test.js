@@ -126,3 +126,21 @@ describe("muhkoo provision collections", () => {
         expect(out()).toMatch(/collections:\s+docs \(202\)/);
     });
 });
+
+describe("muhkoo provision --json", () => {
+    it("prints one result object naming the record it wrote", async () => {
+        const ui = await import("../src/lib/ui.js");
+        ui.setJsonMode(true);
+        const stdout = [];
+        console.log.mockImplementation((...a) => stdout.push(a.join(" ")));
+        try {
+            const outPath = await run({ tables: [tableSpec] }, "--json");
+            expect(stdout).toHaveLength(1);
+            const result = JSON.parse(stdout[0]);
+            expect(result).toMatchObject({ appId: "app1", slug: "s", base: "http://x", recordPath: outPath, tables: ["t1"] });
+            expect(Array.isArray(result.keys)).toBe(true);
+        } finally {
+            ui.setJsonMode(false);
+        }
+    });
+});

@@ -46,7 +46,7 @@ export async function loadClient() {
 }
 
 /**
- * Run a zero-knowledge login and return `{ token, commitment, username }`.
+ * Run a zero-knowledge login and return `{ token, commitment, username, seed }`.
  * Throws (via `die`) on failure.
  */
 export async function zkLogin({ baseUrl, username, password }) {
@@ -58,5 +58,10 @@ export async function zkLogin({ baseUrl, username, password }) {
   const user = await client.auth.zk.login(username, password);
   const token = client.auth.zk.token;
   if (!token) die("Login succeeded but no session token was issued.");
-  return { token, commitment: user?.commitment, username: user?.username ?? username };
+  return {
+    token,
+    commitment: user?.commitment,
+    username: user?.username ?? username,
+    seed: client.auth.zk.seedBase64 ?? null,
+  };
 }

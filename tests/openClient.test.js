@@ -28,10 +28,15 @@ vi.mock("../src/lib/ui.js", async (importOriginal) => ({
 
 /** What the stand-in SDK was asked to do, in order. */
 let events;
+/** The options each Client was built with. */
+let constructed;
 /** Set to a message to make the stored device key fail with it. */
 let deviceFails;
+/** True to stand in for an SDK older than the filesystem change (no `vfs.rehome`). */
+let oldSdk;
 globalThis.__muhkooFakeClient = class {
-    constructor() {
+    constructor(opts) {
+        constructed.push(opts);
         this.auth = {
             zk: {
                 restore: async () => ({ username: "someone" }),
@@ -52,11 +57,12 @@ globalThis.__muhkooFakeClient = class {
             cd: async (path) => {
                 throw new Error(`${path} is gone`);
             },
+            ...(oldSdk ? {} : { rehome: async () => ({ moved: 0, alreadyMoved: 0, notHeld: 0, failed: 0 }) }),
         };
     }
 };
 
-const { openClient, openSession } = await import("../src/lib/vfs.js");
+const { openClient, openSession, pairWithSeed } = await import("../src/lib/vfs.js");
 
 let home;
 let saved;
@@ -74,7 +80,9 @@ beforeEach(async () => {
     delete process.env.MUHKOO_SEED;
     delete process.env.MUHKOO_DEV_TOKEN;
     events = [];
+    constructed = [];
     deviceFails = null;
+    oldSdk = false;
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
 });
@@ -147,6 +155,19 @@ describe("openClient on a paired machine", () => {
     });
 });
 
+describe("openClient with an SDK older than the filesystem change", () => {
+    it("stops before unlocking and says to reinstall the CLI", async () => {
+        oldSdk = true;
+        await withConfig({ token: "t", username: "someone" });
+        vi.spyOn(process, "exit").mockImplementation((code) => {
+            throw new Error(`exit ${code}`);
+        });
+        await expect(openClient(parseArgs(["vfs", "rehome"]))).rejects.toThrow("exit 1");
+        expect(events).toEqual([]);
+        expect(String(console.error.mock.calls.flat().join("\n"))).toContain("This CLI needs @muhkoo/connect 0.15.0-alpha.15 or newer");
+    });
+});
+
 describe("openSession", () => {
     it("restores the session and unlocks nothing: no prompt, no pairing, nothing saved", async () => {
         const before = await withConfig({ token: "t", username: "someone", commitment: "123" });
@@ -167,5 +188,31 @@ describe("openSession", () => {
         } finally {
             globalThis.__muhkooFakeClient = Fake;
         }
+    });
+});
+
+describe("pairWithSeed", () => {
+    it("restores the session, unlocks with the seed, enrols, and saves the pairing without a seed", async () => {
+        await withConfig({ token: "t", seed: "old" });
+        const r = await pairWithSeed({ cfg: { token: "t", seed: "old" }, baseUrl: "https://api.test", token: "t", username: "ann", commitment: "c", seed: "c2VlZA==" });
+        expect(events).toEqual(["unlockWithSeed", "enrollDevice"]);
+        expect(r.factorId).toBe("factor-1");
+        const cfg = JSON.parse(await readFile(configFile(), "utf8"));
+        expect(cfg).toMatchObject({ username: "ann", deviceFactorId: "factor-1", deviceKey: "device-key-1" });
+        expect(cfg.seed).toBeUndefined();
+    });
+});
+
+describe("the filesystem is billed to the account, not an app", () => {
+    it("builds the client with no app key, whatever app was once signed in", async () => {
+        await withConfig({ token: "tok", username: "someone", base: "prod", deviceFactorId: "f", deviceKey: "k", vfsApp: "drive", vfsApps: { drive: "mk_live_pk_drive" } });
+        vi.stubEnv("MUHKOO_APP_KEY", "mk_live_pk_env");
+        try {
+            await openClient(parseArgs(["vfs", "ls", "--key", "mk_live_pk_flag", "--app", "drive"]));
+        } finally {
+            vi.unstubAllEnvs();
+        }
+        expect(constructed.length).toBeGreaterThan(0);
+        for (const opts of constructed) expect(opts.apiKey).toBeUndefined();
     });
 });

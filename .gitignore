@@ -3,3 +3,4 @@ node_modules/
 .muhkoo-app.json
 .DS_Store
 .muhkoo/
+dist/

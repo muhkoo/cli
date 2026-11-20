@@ -9,10 +9,11 @@
 
 import { lstat, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
-import { openClient, explainWriteFailure } from "../lib/vfs.js";
+import { openClient } from "../lib/vfs.js";
 import { mount as mountDir, importOnce, previewMount, heldBack, acceptIgnores, diskIgnoreTexts, assertMountable, mountTarget } from "../lib/mount.js";
 import { draftIgnores, ignoreFileProblem } from "../lib/ignore.js";
-import { loadConfig, saveConfig } from "../lib/config.js";
+import { loadConfig, saveConfig, resolveBase } from "../lib/config.js";
+import { devCall } from "../lib/http.js";
 import { table, json, ok, info, warn, die, writeText, prompt } from "../lib/ui.js";
 
 export const help = `muhkoo vfs — your encrypted filesystem
@@ -62,8 +63,17 @@ Usage:
                                         Ctrl-C or closing the terminal stops it after
                                         the current file; a second Ctrl-C quits now)
   muhkoo vfs sweep [--force]             reclaim orphaned records
-  muhkoo vfs use-app <domain>            use an app, by the domain you use it at
-  muhkoo vfs app                         show which app you are writing as
+  muhkoo vfs use-app <domain>            no longer needed: your filesystem is billed
+                                        to your account (prints a notice)
+  muhkoo vfs app                         likewise
+  muhkoo vfs rehome [--dry-run] [--json] move files stored under an app to your account
+                                        (what older versions of the IDE and
+                                        Cloud Drive wrote); run it once. It
+                                        moves only what your own files point
+                                        at, skips what is already moved, and is
+                                        safe to repeat. --dry-run lists the
+                                        candidates and calls nothing. Exits 1
+                                        if any file failed, so a script can retry
 
 What gets synced is decided by .vcsignore if there is one. Otherwise git's
 rules apply: every .gitignore, each scoped to its own directory, and
@@ -90,22 +100,21 @@ rules is left alone — neither synced nor deleted — and named.
 
 Some paths never sync in either direction, whatever the rules say: .git,
 .ssh, node_modules, .muhkoo, editor and agent config (.vscode, .idea, .claude,
-.cursor, .zed, .fleet), .husky, and shell and credential files (.npmrc,
-.netrc, .zshrc, .zshenv, …). Neither import nor mount will run on your home
-directory, or on anything that contains it. One pass of mount pulls at most
-2 GiB or 10,000 files, and reads at most as much to compare, carrying on at
-once in another pass; what it has read before it does not read again. A pull
-leaves the disk 5% of its space free, at least 1 GiB and at most 10 GiB —
-judged by the bytes that arrive, not the sizes your filesystem reports.
-Ignore files are held to these limits like any other file.
+.cursor, .zed, .fleet), .husky, and shell and credential files
+(.muhkoo-app.json, .npmrc, .netrc, .zshrc, .zshenv, …). Neither import nor
+mount will run on your home directory, or on anything that contains it. One
+pass of mount pulls at most 2 GiB or 10,000 files, and reads at most as much
+to compare, carrying on at once in another pass; what it has read before it
+does not read again. A pull leaves the disk 5% of its space free, at least
+1 GiB and at most 10 GiB — judged by the bytes that arrive, not the sizes
+your filesystem reports. Ignore files are held to these limits like any other
+file.
 
-Reading your files is free. WRITING stores bytes, which are metered to an
-app — so put, rm, cp, mv and restore need an app signed in first.
+Your filesystem is billed to your account, not to an app: nothing to sign in
+to first, and no app key. (\`vfs use-app\`, \`--app\` and \`--key\` are
+accepted and ignored.)
 
 Options:
-  --app <name>   write as this app for one command
-  --key <k>      supply the app key yourself (apps that publish their public
-                 config at /.well-known/muhkoo.json need no key)
   --allow-delete propagate deletions (import: only to your filesystem). OFF by
                  default: a delete removes the file's history too, so unlike an
                  overwrite it cannot be undone. It trusts the remote side. A pass
@@ -121,6 +130,22 @@ Options:
                  machine (it signs in for the one command if it must)
   --no-pair      unlock for this command only; pair nothing to this machine`;
 
+const NOT_NEEDED = "Not needed any more: your filesystem is billed to your account.";
+
+/**
+ * The apps older versions of the IDE and Cloud Drive wrote files under, by id,
+ * per API base. A local base has none. Ids, not slugs: slugs are per account,
+ * these are the two shared apps.
+ */
+export const IDE_APP_IDS = {
+  "https://api.muhkoo.dev": "36bfe1582aaf98e95157e8f80d519d10",
+  "https://api.staging.muhkoo.dev": "7dacbbf0634278f46bc8e6d3ade9199b",
+};
+export const CLOUD_DRIVE_APP_IDS = {
+  "https://api.muhkoo.dev": "53f8d3d5fb6faa9dcefa9df5aba1ae04",
+  "https://api.staging.muhkoo.dev": "999bed2ba01b168d4f70932777392da4",
+};
+
 export default async function vfs(args) {
   const sub = args._[1];
   if (sub === undefined) return die("Missing subcommand. See `muhkoo vfs --help`.");
@@ -131,6 +156,11 @@ export default async function vfs(args) {
   // limiter long before it finishes.
   if (sub === "ignore") return ignoreCommand(args);
 
+  // The app key is gone: the filesystem is billed to your account. Say so for
+  // the old spellings, and ignore them — `use-app` and `app` never needed a
+  // session, so they do not open one.
+  if (sub === "use-app" || sub === "app") return info(NOT_NEEDED);
+
   // Where to sync is checked before the session opens, which can ask for a
   // password: `vfs mount /apps/x --path ./`, the two swapped, unlocked the
   // vault and then set about creating /apps at the top of this disk.
@@ -140,22 +170,22 @@ export default async function vfs(args) {
     if (problem) return die(pathError("import into", problem));
   }
 
+  if (args.key !== undefined || args.app !== undefined) {
+    info(NOT_NEEDED);
+    const { key: _key, app: _app, ...rest } = args;
+    args = rest;
+  }
+
   // A dry run writes nothing, and that includes ~/.muhkoo: unlocking would
   // otherwise pair a machine not paired yet (a device enrolled on the server,
   // its key saved) and reset a stale working directory. It unlocks for this
   // command only. A swallowed directory (`--dry-run <dir>`) still counts.
-  const dryRun = (sub === "import" || sub === "push" || sub === "mount") && Boolean(args["dry-run"]);
+  const dryRun = (sub === "import" || sub === "push" || sub === "mount" || sub === "rehome") && Boolean(args["dry-run"]);
   const client = await openClient(dryRun ? { ...args, pair: false, readOnly: true } : args);
   const fs = client.vfs;
   const a = (n, dflt) => args._[n] ?? dflt;
 
-  try {
-    return await run();
-  } catch (err) {
-    const explained = explainWriteFailure(err, await loadConfig());
-    if (explained) die(...explained);
-    throw err;
-  }
+  return await run();
 
   async function run() {
   switch (sub) {
@@ -277,27 +307,8 @@ export default async function vfs(args) {
       return ok(`Restored ${path} to version ${index} (${humanSize(stat.size)})`);
     }
 
-    case "use-app": {
-      const slug = args._[2];
-      if (!slug) die("Missing app. Usage: muhkoo vfs use-app <slug> [--key <appKey>]");
-      const saved = await useApp(slug, args.key);
-      return ok(
-        `Writing as "${saved.slug}". Reads never needed this; writes are now metered to that app.`,
-      );
-    }
-
-    case "app": {
-      const current = await loadConfig();
-      const slug = current.vfsApp;
-      if (args.json) return json({ app: slug ?? null, known: Object.keys(current.vfsApps ?? {}) });
-      if (!slug) {
-        return info(
-          "Not writing as any app — reads work, writes will not.",
-          "Sign one in with: muhkoo vfs use-app <slug> --key <appKey>",
-        );
-      }
-      return info(`Writing as "${slug}".`);
-    }
+    case "rehome":
+      return rehomeCommand(args, fs);
 
     case "import":
     case "push": {
@@ -653,65 +664,66 @@ function humanSize(bytes) {
 }
 
 /**
- * Point the CLI at an app, by the domain you use it at.
- *
- * A domain is how a USER knows an app — not a slug, and certainly not a key —
- * and this is meant to work for anyone who uses an app, not only whoever built
- * it. So the app publishes its own public config and we read it from there.
- *
- * It has to come from the app rather than the platform: key plaintexts are
- * never stored server-side (only `keyHashPrefix`), so no API can answer "what
- * is the key for this domain". A publishable key is public by design — it ships
- * in the app's own bundle — so the app serving it at a well-known path gives
- * away nothing that loading the app in a browser does not.
- *
- * A bare slug still works for an app you own and have a key for.
+ * `muhkoo vfs rehome`: move files an older app stored under its own billing to
+ * this account. Candidates are the built-in IDE and Cloud Drive ids for this
+ * base plus the ids of the apps named in `vfsApps` (resolved through the apps
+ * list). Moving what is not ours is the server's to refuse, so over-asking is
+ * harmless.
  */
-async function useApp(nameOrDomain, key) {
+async function rehomeCommand(args, fs) {
   const cfg = await loadConfig();
-  const known = cfg.vfsApps ?? {};
-  const looksLikeDomain = nameOrDomain.includes(".");
+  const baseUrl = String(await resolveBase(args, cfg)).replace(/\/+$/, "");
+  const ids = new Set([IDE_APP_IDS[baseUrl], CLOUD_DRIVE_APP_IDS[baseUrl]].filter(Boolean));
 
-  if (!key && !known[nameOrDomain] && looksLikeDomain) {
-    key = await fetchPublicKey(nameOrDomain);
+  const slugs = Object.keys(cfg.vfsApps ?? {});
+  if (slugs.length) {
+    const token = args.token || process.env.MUHKOO_DEV_TOKEN || cfg.token;
+    const listed = await devCall({ baseUrl, token }, "GET", "/api/apps").catch(() => null);
+    const apps = listed?.ok ? (listed.body?.apps || listed.body || []) : null;
+    if (!Array.isArray(apps)) {
+      info("The CLI's own app list couldn't be read, so only the built-in candidates are used.");
+    } else {
+      for (const app of apps) if (!app.deletedAt && slugs.includes(app.slug) && app.appId) ids.add(app.appId);
+    }
   }
+  const fromAppIds = [...ids];
 
-  if (!key && !known[nameOrDomain]) {
-    die(
-      `Could not work out the app key for "${nameOrDomain}".`,
-      ...(looksLikeDomain
-        ? [`That app does not publish ${WELL_KNOWN} yet. Pass it once with --key <appKey>.`]
-        : [
-            `Pass it once with --key <appKey>, or use the domain you access the app at.`,
-            `App keys are shown when an app is created (muhkoo apps create).`,
-          ]),
+  if (args["dry-run"]) {
+    const files = (await fs.walk("/")).length;
+    return info(
+      `${files} file${files === 1 ? "" : "s"} in your filesystem.`,
+      fromAppIds.length
+        ? `Would move anything stored under: ${fromAppIds.join(", ")}`
+        : "No candidate apps for this API base, so nothing would be moved.",
+      "Dry run: nothing was changed.",
     );
   }
-  const next = key ? { ...known, [nameOrDomain]: key } : known;
-  await saveConfig({ ...cfg, vfsApps: next, vfsApp: nameOrDomain });
-  return { slug: nameOrDomain, key: next[nameOrDomain] };
-}
 
-const WELL_KNOWN = "/.well-known/muhkoo.json";
-
-/** Read an app's published public config. Returns the key, or null. */
-async function fetchPublicKey(domain) {
-  const host = domain.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
-  const url = `https://${host}${WELL_KNOWN}`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const body = await res.json();
-    const key = body?.publishableKey ?? body?.key;
-    // Only ever accept a PUBLISHABLE key from a public document. A site that
-    // served a secret key here would be leaking it, and storing it because it
-    // was offered would make us complicit in that.
-    if (typeof key !== "string" || !/_pk_/.test(key)) return null;
-    info(`Read ${host}'s public config (app ${body?.slug ?? body?.appId ?? "?"}).`);
-    return key;
-  } catch {
-    return null;
+  let progressShown = false;
+  const result = await fs.rehome({
+    fromAppIds,
+    onProgress: args.json ? undefined : (done, total) => {
+      if (process.stderr.isTTY) {
+        process.stderr.write(`\r  ${done}/${total}`);
+        progressShown = true;
+      }
+    },
+  });
+  // End the `\r n/m` line, so the summary does not print over it.
+  if (progressShown) process.stderr.write("\n");
+  if (args.json) {
+    json(result);
+  } else {
+    ok("Rehome finished.");
+    info(
+      `  moved:         ${result.moved}`,
+      `  already moved: ${result.alreadyMoved}`,
+      `  not held:      ${result.notHeld}`,
+      `  failed:        ${result.failed}`,
+    );
   }
+  // `die`, not `process.exitCode`: the launcher exits 0 once a command returns.
+  if (result.failed > 0) return die(`${result.failed} file${result.failed === 1 ? "" : "s"} could not be moved. Run \`muhkoo vfs rehome\` again to retry.`);
 }
 
 /**

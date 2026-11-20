@@ -39,6 +39,13 @@ app is provisioned every command runs with no extra flags. `deploy` publishes to
 app's **test** environment; once it looks right on the test URL, `promote` copies that
 release onto **production**, in place.
 
+Once the release is live, `deploy` also copies the project into your filesystem at
+`/apps/<slug>`, where the IDE opens it. It is the copy `muhkoo vfs import . --path
+/apps/<slug>` makes (see [Syncing a directory](#syncing-a-directory)), and it needs you
+signed in to the same environment with this machine paired, or a terminal to pair it
+in. Without them, as in CI, `deploy` says why in one line and skips the copy. A failed
+copy is a warning, not a failed deploy. `--no-vfs` skips it.
+
 ## Sign in
 
 ```bash
@@ -107,7 +114,7 @@ Account     login · logout · devices ls|rm · whoami
 Apps        apps ls|get|create|slug|rm · keys rotate · tokens ls|create|revoke
 Backend     provision · tables · agents · functions · vectors ls|get|create|rm|notices|query
 Files       vfs cd|pwd|ls|stat|tree|cat|put|get|mkdir|rm|cp|mv|find|history|restore
-            vfs import|mount|ignore · vfs sweep|use-app|app
+            vfs import|mount|ignore · vfs sweep|rehome
             vcs status|commit|log|show|diff|branch|switch|checkout|merge|restore · vcs merge --abort
             kv ls [prefix]
 Hosting     deploy · promote · hosting status|rollback|rm-release|unpublish · domains
@@ -120,7 +127,7 @@ Run `muhkoo <command> --help` for details. A few highlights:
 muhkoo apps ls                                  # list your apps
 muhkoo provision --spec app.json --dry-run      # preview API calls
 muhkoo provision --spec app.json --enable       # enable agents/functions on channels
-muhkoo deploy                                   # publish dist/ to the test env
+muhkoo deploy                                   # publish dist/ to the test env, copy the project to /apps/<slug>
 muhkoo promote                                  # promote test → production, in place
 muhkoo hosting status <appId>                   # releases + current pointer
 muhkoo hosting rollback <appId> --release <id>  # instant rollback
@@ -128,6 +135,28 @@ muhkoo domains add <appId> app.example.com      # attach a custom domain
 muhkoo agents enable <appId> <agentId> --channel general
 muhkoo eject src/agent/agentApp.ts              # preview an agent's prompt + tools
 ```
+
+## Use with Claude
+
+`muhkoo mcp` runs the CLI as an MCP server, so Claude can create apps, deploy,
+manage functions, tables and domains, and browse your filesystem for you. It
+uses the login on this computer: run `muhkoo login` first.
+
+```bash
+# Claude Code
+claude mcp add muhkoo -- npx -y @muhkoo/cli mcp
+
+# Claude Desktop: build the extension, then Settings → Extensions → install it
+npm run build:mcpb        # → dist/muhkoo.mcpb
+```
+
+- `deploy` goes to your app's **test** environment. Only `promote` reaches
+  production, and it, every delete, key rotation and new access token is marked
+  so Claude asks you first.
+- Secret keys and access tokens never appear in the conversation. They are
+  saved to the project's `.muhkoo-app.json` or `~/.muhkoo/secrets/` (owner-only),
+  and Claude gets the file path.
+- Paths on your computer must be absolute; filesystem paths start with `/`.
 
 ## Syncing a directory
 
@@ -181,11 +210,12 @@ and it cannot reach this disk except through these checks:
 - **Some paths never sync, in either direction.** No flag and no ignore rule
   changes that: `.git`, `.ssh`, `.muhkoo`, `node_modules`, `.husky`, editor and
   agent directories (`.vscode`, `.idea`, `.config`, `.claude`, `.cursor`,
-  `.zed`, `.fleet`), and credential and shell start-up files (`.envrc`,
-  `.npmrc`, `.netrc`, `.gitconfig`, `.profile`, `.bashrc`, `.zshrc`, `.zshenv`
-  and the rest). Each one either holds credentials or can run code without an
-  execute bit. Names are compared the way a case-folding volume would compare
-  them, so `Node_Modules`, `.GIT` and `GIT~1` are refused too.
+  `.zed`, `.fleet`), and credential and shell start-up files
+  (`.muhkoo-app.json`, `.envrc`, `.npmrc`, `.netrc`, `.gitconfig`, `.profile`,
+  `.bashrc`, `.zshrc`, `.zshenv` and the rest). Each one either holds
+  credentials (`.muhkoo-app.json` holds an app's secret keys) or can run code
+  without an execute bit. Names are compared the way a case-folding volume
+  would compare them, so `Node_Modules`, `.GIT` and `GIT~1` are refused too.
 - **Never your home directory.** Both commands refuse the filesystem root, your
   home directory, and anything that contains it. There is no override.
 - **One write boundary.** Every write and delete on disk checks each part of

@@ -62,21 +62,39 @@ export const c = {
 // Each argument is one line: a newline INSIDE an argument is escaped like
 // any other control character, so a message that runs to several lines
 // passes them as separate arguments.
+//
+// Under `--json` (see setJsonMode) stdout belongs to the one result object a
+// program reads, so these progress lines go to stderr instead.
+let jsonMode = false;
+
+/** Turn JSON mode on for this process: progress → stderr, `die()` → `{"error"}` on stdout. */
+export function setJsonMode(on) {
+  jsonMode = Boolean(on);
+}
+export function isJsonMode() {
+  return jsonMode;
+}
+const say = (text) => (jsonMode ? console.error(text) : console.log(text));
+
 export function info(...all) {
-  console.log(lines(all));
+  say(lines(all));
 }
 export function ok(first, ...more) {
-  console.log(lines([`${c.green("✓")} ${first}`, ...more]));
+  say(lines([`${c.green("✓")} ${first}`, ...more]));
 }
 export function warn(first, ...more) {
-  console.log(lines([`${c.yellow("⚠")} ${first}`, ...more]));
+  say(lines([`${c.yellow("⚠")} ${first}`, ...more]));
 }
 export function step(first, ...more) {
-  console.log(lines([`${c.dim("→")} ${first}`, ...more]));
+  say(lines([`${c.dim("→")} ${first}`, ...more]));
 }
 
-/** Print an error and exit non-zero. */
+/** Print an error and exit non-zero. Under `--json`, as `{"error": "…"}` on stdout. */
 export function die(first, ...more) {
+  if (jsonMode) {
+    json({ error: [first, ...more].map((l) => printable(l).replace(MARKS, "")).join("\n") });
+    process.exit(1);
+  }
   console.error(lines(["", `${c.red("✗")} ${first}`, ...more, ""]));
   process.exit(1);
 }
@@ -132,8 +150,14 @@ export function table(headers, rows) {
   for (const r of body) console.log(out(line(r)));
 }
 
+// Set by the MCP server's runner, where there is no one at stdin to answer:
+// fail at once rather than wait for the tool's timeout.
+const NOT_INTERACTIVE = "not signed in on this machine — use the login tool (or run `muhkoo login` in a terminal)";
+const interactive = () => process.env.MUHKOO_NONINTERACTIVE !== "1";
+
 /** Prompt for a line of input on stdin. */
 export async function prompt(question) {
+  if (!interactive()) throw new Error(NOT_INTERACTIVE);
   const rl = (await import("node:readline/promises")).createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -150,6 +174,7 @@ export async function prompt(question) {
  * non-TTY (piped) it just reads a line.
  */
 export function promptHidden(question) {
+  if (!interactive()) return Promise.reject(new Error(NOT_INTERACTIVE));
   const stdin = process.stdin;
   const stdout = process.stdout;
   if (!stdin.isTTY) return prompt(question);

@@ -8,7 +8,7 @@
  */
 
 import { run } from "../src/index.js";
-import { printable } from "../src/lib/ui.js";
+import { printable, isJsonMode, json } from "../src/lib/ui.js";
 import { drained } from "../src/lib/drain.js";
 
 run(process.argv.slice(2))
@@ -19,6 +19,12 @@ run(process.argv.slice(2))
     // name or a server's words. The message is one line; the stack's frames
     // are Node's own lines.
     const head = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    // Under --json a program is reading stdout: one {"error"} object, no stack.
+    if (isJsonMode()) {
+      json({ error: printable(e instanceof Error ? e.message : String(e)) });
+      await drained();
+      process.exit(1);
+    }
     const stack = e instanceof Error && typeof e.stack === "string" ? e.stack : "";
     const frames = stack.startsWith(head) ? stack.slice(head.length).split("\n").filter(Boolean) : [];
     console.error(["", `✗ ${printable(head)}`, ...frames.map(printable), ""].join("\n"));

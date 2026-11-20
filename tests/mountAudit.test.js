@@ -220,10 +220,11 @@ describe("refused paths are refused in BOTH directions [G7]", () => {
         await put(dir, ".git/config", "[remote \"origin\"]\n\turl = https://x-access-token:ghp_SECRET@github.com/o/r.git\n");
         await put(dir, ".npmrc", "//registry.npmjs.org/:_authToken=npm_SECRET\n");
         await put(dir, ".netrc", "machine github.com login me password hunter2\n");
+        await put(dir, ".muhkoo-app.json", "{\"appId\":\"a1\",\"keys\":[{\"type\":\"sk\",\"plaintext\":\"mk_live_sk_SECRET\"}]}\n");
         return dir;
     }
 
-    it("--hidden never uploads .git, .npmrc or .netrc, and does not loop", async () => {
+    it("--hidden never uploads .git, .npmrc, .netrc or .muhkoo-app.json, and does not loop", async () => {
         const { vfs } = realVfs();
         const { vfs: counted, calls } = counting(vfs);
         const dir = await project();
@@ -243,6 +244,7 @@ describe("refused paths are refused in BOTH directions [G7]", () => {
         expect(await exists(join(dir, ".git", "config"))).toBe(true);
         expect(await exists(join(dir, ".git", "HEAD"))).toBe(true);
         expect(await exists(join(dir, ".npmrc"))).toBe(true);
+        expect(await exists(join(dir, ".muhkoo-app.json"))).toBe(true);
     });
 
     it("an old state entry for a refused path deletes nothing", async () => {

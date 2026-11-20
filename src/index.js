@@ -8,7 +8,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { parseArgs } from "./lib/args.js";
-import { c, die, info } from "./lib/ui.js";
+import { c, die, info, setJsonMode } from "./lib/ui.js";
 
 const COMMANDS = {
   login: () => import("./commands/login.js"),
@@ -32,6 +32,7 @@ const COMMANDS = {
   functions: () => import("./commands/functions.js"),
   logs: () => import("./commands/logs.js"),
   eject: () => import("./commands/eject.js"),
+  mcp: () => import("./commands/mcp.js"),
 };
 
 const TOP_HELP = `${c.bold("muhkoo")} — command-line interface for the Muhkoo platform
@@ -63,13 +64,14 @@ Files
   vfs import|mount|ignore
                          upload a project, keep a directory in sync, and
                          choose what syncs
-  vfs sweep|use-app|app  reclaim records; pick the app writes are made as
+  vfs sweep|rehome       reclaim records; move files an app stored to your account
+  vfs use-app|app        no longer needed (filesystem storage is billed to you)
   vcs status|commit|log|show|diff|branch|switch|checkout|merge|restore
                          version control over it
   kv ls [prefix]         keys in your personal key/value store
 
 Hosting
-  deploy                 deploy a built client to Muhkoo hosting (test env)
+  deploy                 deploy a built client to the test env (--prod: production)
   promote                promote an app's test hosting → production
   hosting status|rollback|rm-release|unpublish
   domains ls|add|rm      manage custom domains
@@ -77,6 +79,7 @@ Hosting
 Tools
   logs <appId>           inspect an app's server-log Space
   eject <agentApp.ts>    preview an agent's compiled prompt + tools
+  mcp                    run as an MCP server for Claude (stdio)
 
 Global options
   --base <env|url>       prod (default) | staging | local | a literal URL
@@ -99,6 +102,7 @@ export async function run(argv) {
   const wantsHelp = argv.includes("--help") || argv.includes("-h");
   const args = parseArgs(argv.map((a) => (a === "-h" ? "--help" : a === "-v" ? "--version" : a)));
   const name = args._[0];
+  if (args.json) setJsonMode(true);
 
   if (wantsVersion) return info(await version());
   if (!name || name === "help") return info(...TOP_HELP.split("\n"));

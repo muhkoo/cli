@@ -49,6 +49,13 @@ describe("isRefused", () => {
         expect(isRefused("deep/nested/.envrc")).toBe(true);
     });
 
+    it("refuses .muhkoo-app.json, which holds the app's secret keys", () => {
+        // `muhkoo deploy` imports the folder that holds it.
+        expect(isRefused(".muhkoo-app.json")).toBe(true);
+        expect(isRefused("apps/web/.muhkoo-app.json")).toBe(true);
+        expect(isRefused(".muhkoo-app.json.example")).toBe(false);
+    });
+
     it("leaves ordinary project files alone", () => {
         expect(isRefused("src/index.ts")).toBe(false);
         expect(isRefused("README.md")).toBe(false);

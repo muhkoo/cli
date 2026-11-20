@@ -20,8 +20,6 @@ Usage:
   muhkoo kv ls [<prefix>] [--json]   keys that start with <prefix> (default: all)
 
 Options:
-  --app <slug>   the app the read is made as (default: the one from
-                 \`muhkoo vfs use-app\`); reads work without one
   --json         a JSON array of keys
 
 Keys only: this command never reads a value. Put --json after "ls".

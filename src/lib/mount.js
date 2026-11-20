@@ -323,6 +323,9 @@ const REFUSED_DIRS = new Set([
     ".husky", ".claude", ".cursor", ".zed", ".fleet",
 ]);
 const REFUSED_FILES = new Set([
+    // `.muhkoo-app.json` is what `muhkoo provision` writes: the app id and its
+    // secret keys. `muhkoo deploy` imports the folder holding it.
+    ".muhkoo-app.json",
     ".envrc", ".npmrc", ".netrc", ".gitconfig", ".pam_environment", ".xprofile",
     ".profile", ".bashrc", ".bash_profile", ".bash_login", ".bash_logout",
     ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout", ".kshrc",

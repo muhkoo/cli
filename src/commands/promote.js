@@ -54,7 +54,6 @@ export default async function promote(args) {
   const { report = {}, errors = [] } = r.body || {};
 
   if (args.json) {
-    info("");
     json(r.body);
   } else {
     info("");
